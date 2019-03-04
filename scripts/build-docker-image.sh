@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -xeuo pipefail
+set -euo pipefail
 
 cd "$(dirname "$(readlink -f "../${BASH_SOURCE[0]}")")"
 
@@ -9,3 +9,4 @@ cd "$(dirname "$(readlink -f "../${BASH_SOURCE[0]}")")"
 . gradle.properties
 
 docker build . -t kaloom/podagent:$version
+docker tag kaloom/podagent:$version kaloom/podagent:latest
