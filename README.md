@@ -26,7 +26,7 @@ Let assume we started a Pod with no network attachments (i.e. just the default n
 
 |                                                              |                          |
 |--------------------------------------------------------------|:--------------------------|
-|![add a network attachment](assets/add-network-attachment.png)| The watch in this case will fire, the received data from the watch would contains (among other things) the old and new network attachmenet data, we can deduce from the constructed sets that the *green* network attachment has been added, the podagent will:|
+|![add a network attachment](assets/add-network-attachment.png)| The watch in this case will fire, the received data from the watch would contains (among other things) the old and new network attachment data, we can deduce from the constructed sets that the *green* network attachment has been added, the podagent will:|
 ||* find the network namespace from the container runtime interface using the Pod’s container id
 ||* prepare the cni environment variables parameters; network attachment name will be amongst them (i.e. in *CNI_ARGS*)
 ||* invoke the cni-plugin with the collected cni parameters, *CNI_COMMAND=ADD*
@@ -41,7 +41,7 @@ Let assume we have a *RUNNING* Pod with 2 network attachements *red* and *green*
 
 |                                                              |                          |
 |--------------------------------------------------------------|:--------------------------|
-|![delete a network attachment](assets/delete-network-attachment.png)| The watch in this case will fire, the received data from the watch would contains (among other things) the old and new network attachmenet data, we can deduce from the constructed sets that the *red* network attachment has been deleted, the podagent will:|
+|![delete a network attachment](assets/delete-network-attachment.png)| The watch in this case will fire, the received data from the watch would contains (among other things) the old and new network attachment data, we can deduce from the constructed sets that the *red* network attachment has been deleted, the podagent will:|
 ||* find the network namespace from the container runtime interface using the Pod’s container id
 ||* prepare the cni environment variables parameters; network attachment name will be amongst them (i.e. in *CNI_ARGS*)
 ||* invoke the cni-plugin with the collected cni parameters, *CNI_COMMAND=DEL*
