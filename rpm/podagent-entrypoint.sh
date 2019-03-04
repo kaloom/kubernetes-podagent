@@ -1,0 +1,1 @@
+../scripts/podagent-entrypoint.sh

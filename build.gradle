@@ -1,0 +1,57 @@
+/*
+Copyright 2019 Kaloom Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+plugins {
+  id 'com.github.blindpirate.gogradle' version '0.10.2'
+}
+
+dependencies {
+  golang {
+    build name:'github.com/kaloom/kubernetes-common', commit: 'LATEST_COMMIT'
+
+    build name:'k8s.io/client-go', commit:'271cb504b63ed762a3aea146bd842015da5a79c4'
+    build name:'k8s.io/apimachinery', commit:'e9a29eff7d472df0f7da9ead5ab59b74e74a07ec'
+    build name:'k8s.io/api', commit:'409c3b2393cd3359f275bd8b883b4d9c5aec41f6'
+    build name:'k8s.io/apiserver', commit:'d299c880c4e33854f8c45bdd7ab599fb54cbe575'
+    build name:'k8s.io/kubernetes', commit:'d515f0e3d2a2b3afc53fc839d6df6f34ed76c3bf'
+    build name:'k8s.io/utils', commit:'1dbc8f1cec395db25b912b93257c400765c08146'
+    build name:'k8s.io/apiextensions-apiserver', commit:'83f1a7e2b8384c17fb102b6616e08825ad12992d'
+  }
+}
+
+golang {
+  goVersion = "${project.goVersion}"
+  packagePath = "${project.packageRepo}"
+}
+
+defaultTasks 'build'
+
+def gitCommit = "git rev-parse --verify --short HEAD".execute().text.trim()
+def gitBranch = "git describe --tags --abbrev=0".execute().text.trim() ? "" : "master"
+def buildDate = new Date().format("yyyy-MM-dd_HH:mm:ss.sss_Z", TimeZone.getTimeZone("UTC"))
+def ldflags = "-ldflags \"-X main.branch=${gitBranch} -X main.commit=${gitCommit} -X main.date=${buildDate}\""
+
+build {
+  go "build ${ldflags} -o ${project.binDir}/${project.execName} ${project.packageRepo}/${project.execName}"
+}
+
+clean {
+  doLast {
+    [ ".gogradle", ".gradle" ].each {
+      delete "${it}"
+    }
+  }
+}

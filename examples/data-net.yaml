@@ -1,0 +1,25 @@
+apiVersion: kaloom.com/v1
+kind: Network
+metadata:
+  name: data
+spec:
+  plugin: bridge
+  config: '
+         {
+           "cniVersion": "0.3.1",
+           "name": "data",
+           "type": "bridge",
+           "bridge": "data-br",
+           "ipam": {
+             "type": "host-local",
+             "subnet": "172.20.1.0/24",
+             "rangeStart": "172.20.1.10",
+             "rangeEnd": "172.20.1.254",
+             "routes": [
+               {
+                "dst": "0.0.0.0/0"
+               }
+             ]
+           }
+         }
+'

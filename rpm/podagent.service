@@ -1,0 +1,13 @@
+[Unit]
+Description=Kubernetes Podagent
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=/opt/kaloom/bin/podagent-entrypoint.sh
+Restart=always
+StartLimitInterval=0
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
