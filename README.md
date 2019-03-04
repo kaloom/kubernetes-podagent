@@ -91,7 +91,7 @@ see [kactus cni-plugin repo](https://github.com/kaloom/kubernetes-kactus-cni-plu
 
 ## As DaemonSet
 
-1. [setup kactus](https://github.com/kaloom/kubernetes-kactus-cni-plugin/README.md) as the master cni-plugin in your Kubernetes cluster
+1. [setup kactus](https://github.com/kaloom/kubernetes-kactus-cni-plugin/blob/master/README.md) as the master cni-plugin in your Kubernetes cluster
 
 2. create a Kubernetes service account, cluster role and cluster role binding for the podagent:
 
@@ -113,7 +113,7 @@ Currently, to deploy the podagent as DaemonSet
 
 ## As systemd service
 
-1. [setup kactus](https://github.com/kaloom/kubernetes-kactus-cni-plugin/README.md) as the master cni-plugin in your Kubernetes cluster
+1. [setup kactus](https://github.com/kaloom/kubernetes-kactus-cni-plugin/blob/master/README.md) as the master cni-plugin in your Kubernetes cluster
 
 2. build the podagent rpm package
 
