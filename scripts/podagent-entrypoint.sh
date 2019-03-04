@@ -15,7 +15,7 @@ fi
 while :; do
     for f in ${cninet_top_dir}/etc/cni/net.d/*; do
 	if [ -f $f ]; then # wait until we see the 1st lexically cni config file
-	    echo "cni config $f is readable"
+	    echo "cni config $f is for the system cni-plugin in effect"
 	    cni_cfg_file=$f
 	    break 2
 	fi
