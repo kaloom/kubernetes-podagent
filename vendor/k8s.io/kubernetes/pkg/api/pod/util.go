@@ -17,11 +17,72 @@ limitations under the License.
 package pod
 
 import (
+	"strings"
+
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/features"
 )
+
+// ContainerType signifies container type
+type ContainerType int
+
+const (
+	// Containers is for normal containers
+	Containers ContainerType = 1 << iota
+	// InitContainers is for init containers
+	InitContainers
+	// EphemeralContainers is for ephemeral containers
+	EphemeralContainers
+)
+
+// AllContainers specifies that all containers be visited
+const AllContainers ContainerType = (InitContainers | Containers | EphemeralContainers)
+
+// AllFeatureEnabledContainers returns a ContainerType mask which includes all container
+// types except for the ones guarded by feature gate.
+func AllFeatureEnabledContainers() ContainerType {
+	containerType := AllContainers
+	if !utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
+		containerType &= ^EphemeralContainers
+	}
+	return containerType
+}
+
+// ContainerVisitor is called with each container spec, and returns true
+// if visiting should continue.
+type ContainerVisitor func(container *api.Container, containerType ContainerType) (shouldContinue bool)
+
+// VisitContainers invokes the visitor function with a pointer to every container
+// spec in the given pod spec with type set in mask. If visitor returns false,
+// visiting is short-circuited. VisitContainers returns true if visiting completes,
+// false if visiting was short-circuited.
+func VisitContainers(podSpec *api.PodSpec, mask ContainerType, visitor ContainerVisitor) bool {
+	if mask&InitContainers != 0 {
+		for i := range podSpec.InitContainers {
+			if !visitor(&podSpec.InitContainers[i], InitContainers) {
+				return false
+			}
+		}
+	}
+	if mask&Containers != 0 {
+		for i := range podSpec.Containers {
+			if !visitor(&podSpec.Containers[i], Containers) {
+				return false
+			}
+		}
+	}
+	if mask&EphemeralContainers != 0 {
+		for i := range podSpec.EphemeralContainers {
+			if !visitor((*api.Container)(&podSpec.EphemeralContainers[i].EphemeralContainerCommon), EphemeralContainers) {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // Visitor is called with each object name, and returns true if visiting should continue
 type Visitor func(name string) (shouldContinue bool)
@@ -30,22 +91,15 @@ type Visitor func(name string) (shouldContinue bool)
 // referenced by the pod spec. If visitor returns false, visiting is short-circuited.
 // Transitive references (e.g. pod -> pvc -> pv -> secret) are not visited.
 // Returns true if visiting completed, false if visiting was short-circuited.
-func VisitPodSecretNames(pod *api.Pod, visitor Visitor) bool {
+func VisitPodSecretNames(pod *api.Pod, visitor Visitor, containerType ContainerType) bool {
 	for _, reference := range pod.Spec.ImagePullSecrets {
 		if !visitor(reference.Name) {
 			return false
 		}
 	}
-	for i := range pod.Spec.InitContainers {
-		if !visitContainerSecretNames(&pod.Spec.InitContainers[i], visitor) {
-			return false
-		}
-	}
-	for i := range pod.Spec.Containers {
-		if !visitContainerSecretNames(&pod.Spec.Containers[i], visitor) {
-			return false
-		}
-	}
+	VisitContainers(&pod.Spec, containerType, func(c *api.Container, containerType ContainerType) bool {
+		return visitContainerSecretNames(c, visitor)
+	})
 	var source *api.VolumeSource
 	for i := range pod.Spec.Volumes {
 		source = &pod.Spec.Volumes[i].VolumeSource
@@ -56,6 +110,10 @@ func VisitPodSecretNames(pod *api.Pod, visitor Visitor) bool {
 			}
 		case source.CephFS != nil:
 			if source.CephFS.SecretRef != nil && !visitor(source.CephFS.SecretRef.Name) {
+				return false
+			}
+		case source.Cinder != nil:
+			if source.Cinder.SecretRef != nil && !visitor(source.Cinder.SecretRef.Name) {
 				return false
 			}
 		case source.FlexVolume != nil:
@@ -90,6 +148,10 @@ func VisitPodSecretNames(pod *api.Pod, visitor Visitor) bool {
 			if source.StorageOS.SecretRef != nil && !visitor(source.StorageOS.SecretRef.Name) {
 				return false
 			}
+		case source.CSI != nil:
+			if source.CSI.NodePublishSecretRef != nil && !visitor(source.CSI.NodePublishSecretRef.Name) {
+				return false
+			}
 		}
 	}
 	return true
@@ -117,17 +179,10 @@ func visitContainerSecretNames(container *api.Container, visitor Visitor) bool {
 // referenced by the pod spec. If visitor returns false, visiting is short-circuited.
 // Transitive references (e.g. pod -> pvc -> pv -> secret) are not visited.
 // Returns true if visiting completed, false if visiting was short-circuited.
-func VisitPodConfigmapNames(pod *api.Pod, visitor Visitor) bool {
-	for i := range pod.Spec.InitContainers {
-		if !visitContainerConfigmapNames(&pod.Spec.InitContainers[i], visitor) {
-			return false
-		}
-	}
-	for i := range pod.Spec.Containers {
-		if !visitContainerConfigmapNames(&pod.Spec.Containers[i], visitor) {
-			return false
-		}
-	}
+func VisitPodConfigmapNames(pod *api.Pod, visitor Visitor, containerType ContainerType) bool {
+	VisitContainers(&pod.Spec, containerType, func(c *api.Container, containerType ContainerType) bool {
+		return visitContainerConfigmapNames(c, visitor)
+	})
 	var source *api.VolumeSource
 	for i := range pod.Spec.Volumes {
 		source = &pod.Spec.Volumes[i].VolumeSource
@@ -172,7 +227,7 @@ func IsPodReady(pod *api.Pod) bool {
 	return IsPodReadyConditionTrue(pod.Status)
 }
 
-// IsPodReadyConditionTrue retruns true if a pod is ready; false otherwise.
+// IsPodReadyConditionTrue returns true if a pod is ready; false otherwise.
 func IsPodReadyConditionTrue(status api.PodStatus) bool {
 	condition := GetPodReadyCondition(status)
 	return condition != nil && condition.Status == api.ConditionTrue
@@ -228,35 +283,494 @@ func UpdatePodCondition(status *api.PodStatus, condition *api.PodCondition) bool
 	return !isEqual
 }
 
-// DropDisabledAlphaFields removes disabled fields from the pod spec.
-// This should be called from PrepareForCreate/PrepareForUpdate for all resources containing a pod spec.
-func DropDisabledAlphaFields(podSpec *api.PodSpec) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.PodPriority) {
-		podSpec.Priority = nil
-		podSpec.PriorityClassName = ""
+// DropDisabledTemplateFields removes disabled fields from the pod template metadata and spec.
+// This should be called from PrepareForCreate/PrepareForUpdate for all resources containing a PodTemplateSpec
+func DropDisabledTemplateFields(podTemplate, oldPodTemplate *api.PodTemplateSpec) {
+	var (
+		podSpec           *api.PodSpec
+		podAnnotations    map[string]string
+		oldPodSpec        *api.PodSpec
+		oldPodAnnotations map[string]string
+	)
+	if podTemplate != nil {
+		podSpec = &podTemplate.Spec
+		podAnnotations = podTemplate.Annotations
+	}
+	if oldPodTemplate != nil {
+		oldPodSpec = &oldPodTemplate.Spec
+		oldPodAnnotations = oldPodTemplate.Annotations
+	}
+	dropDisabledFields(podSpec, podAnnotations, oldPodSpec, oldPodAnnotations)
+}
+
+// DropDisabledPodFields removes disabled fields from the pod metadata and spec.
+// This should be called from PrepareForCreate/PrepareForUpdate for all resources containing a Pod
+func DropDisabledPodFields(pod, oldPod *api.Pod) {
+	var (
+		podSpec           *api.PodSpec
+		podAnnotations    map[string]string
+		oldPodSpec        *api.PodSpec
+		oldPodAnnotations map[string]string
+		podStatus         *api.PodStatus
+		oldPodStatus      *api.PodStatus
+	)
+	if pod != nil {
+		podSpec = &pod.Spec
+		podAnnotations = pod.Annotations
+		podStatus = &pod.Status
+	}
+	if oldPod != nil {
+		oldPodSpec = &oldPod.Spec
+		oldPodAnnotations = oldPod.Annotations
+		oldPodStatus = &oldPod.Status
+	}
+	dropDisabledFields(podSpec, podAnnotations, oldPodSpec, oldPodAnnotations)
+	dropPodStatusDisabledFields(podStatus, oldPodStatus)
+}
+
+// dropPodStatusDisabledFields removes disabled fields from the pod status
+func dropPodStatusDisabledFields(podStatus *api.PodStatus, oldPodStatus *api.PodStatus) {
+	// trim PodIPs down to only one entry (non dual stack).
+	if !utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) &&
+		!multiplePodIPsInUse(oldPodStatus) {
+		if len(podStatus.PodIPs) != 0 {
+			podStatus.PodIPs = podStatus.PodIPs[0:1]
+		}
+	}
+}
+
+// dropDisabledFields removes disabled fields from the pod metadata and spec.
+func dropDisabledFields(
+	podSpec *api.PodSpec, podAnnotations map[string]string,
+	oldPodSpec *api.PodSpec, oldPodAnnotations map[string]string,
+) {
+	// the new spec must always be non-nil
+	if podSpec == nil {
+		podSpec = &api.PodSpec{}
 	}
 
-	if !utilfeature.DefaultFeatureGate.Enabled(features.LocalStorageCapacityIsolation) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.TokenRequestProjection) &&
+		!tokenRequestProjectionInUse(oldPodSpec) {
+		for i := range podSpec.Volumes {
+			if podSpec.Volumes[i].Projected != nil {
+				for j := range podSpec.Volumes[i].Projected.Sources {
+					podSpec.Volumes[i].Projected.Sources[j].ServiceAccountToken = nil
+				}
+			}
+
+		}
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.AppArmor) && !appArmorInUse(oldPodAnnotations) {
+		for k := range podAnnotations {
+			if strings.HasPrefix(k, v1.AppArmorBetaContainerAnnotationKeyPrefix) {
+				delete(podAnnotations, k)
+			}
+		}
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.Sysctls) && !sysctlsInUse(oldPodSpec) {
+		if podSpec.SecurityContext != nil {
+			podSpec.SecurityContext.Sysctls = nil
+		}
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.LocalStorageCapacityIsolation) && !emptyDirSizeLimitInUse(oldPodSpec) {
 		for i := range podSpec.Volumes {
 			if podSpec.Volumes[i].EmptyDir != nil {
 				podSpec.Volumes[i].EmptyDir.SizeLimit = nil
 			}
 		}
 	}
-	for i := range podSpec.Containers {
-		DropDisabledVolumeMountsAlphaFields(podSpec.Containers[i].VolumeMounts)
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.VolumeSubpath) && !subpathInUse(oldPodSpec) {
+		// drop subpath from the pod if the feature is disabled and the old spec did not specify subpaths
+		VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+			for i := range c.VolumeMounts {
+				c.VolumeMounts[i].SubPath = ""
+			}
+			return true
+		})
 	}
-	for i := range podSpec.InitContainers {
-		DropDisabledVolumeMountsAlphaFields(podSpec.InitContainers[i].VolumeMounts)
+	if !utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) && !ephemeralContainersInUse(oldPodSpec) {
+		podSpec.EphemeralContainers = nil
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.VolumeSubpath) && !subpathExprInUse(oldPodSpec) {
+		// drop subpath env expansion from the pod if subpath feature is disabled and the old spec did not specify subpath env expansion
+		VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+			for i := range c.VolumeMounts {
+				c.VolumeMounts[i].SubPathExpr = ""
+			}
+			return true
+		})
+	}
+
+	dropDisabledRunAsGroupField(podSpec, oldPodSpec)
+
+	dropDisabledFSGroupFields(podSpec, oldPodSpec)
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClass) && !runtimeClassInUse(oldPodSpec) {
+		// Set RuntimeClassName to nil only if feature is disabled and it is not used
+		podSpec.RuntimeClassName = nil
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodOverhead) && !overheadInUse(oldPodSpec) {
+		// Set Overhead to nil only if the feature is disabled and it is not used
+		podSpec.Overhead = nil
+	}
+
+	dropDisabledProcMountField(podSpec, oldPodSpec)
+
+	dropDisabledCSIVolumeSourceAlphaFields(podSpec, oldPodSpec)
+	dropDisabledEphemeralVolumeSourceAlphaFields(podSpec, oldPodSpec)
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.NonPreemptingPriority) &&
+		!podPriorityInUse(oldPodSpec) {
+		// Set to nil pod's PreemptionPolicy fields if the feature is disabled and the old pod
+		// does not specify any values for these fields.
+		podSpec.PreemptionPolicy = nil
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.SetHostnameAsFQDN) && !setHostnameAsFQDNInUse(oldPodSpec) {
+		// Set SetHostnameAsFQDN to nil only if feature is disabled and it is not used
+		podSpec.SetHostnameAsFQDN = nil
+	}
+
+}
+
+// dropDisabledRunAsGroupField removes disabled fields from PodSpec related
+// to RunAsGroup
+func dropDisabledRunAsGroupField(podSpec, oldPodSpec *api.PodSpec) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.RunAsGroup) && !runAsGroupInUse(oldPodSpec) {
+		if podSpec.SecurityContext != nil {
+			podSpec.SecurityContext.RunAsGroup = nil
+		}
+		VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+			if c.SecurityContext != nil {
+				c.SecurityContext.RunAsGroup = nil
+			}
+			return true
+		})
 	}
 }
 
-// DropDisabledVolumeMountsAlphaFields removes disabled fields from []VolumeMount.
-// This should be called from PrepareForCreate/PrepareForUpdate for all resources containing a VolumeMount
-func DropDisabledVolumeMountsAlphaFields(volumeMounts []api.VolumeMount) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.MountPropagation) {
-		for i := range volumeMounts {
-			volumeMounts[i].MountPropagation = nil
+// dropDisabledProcMountField removes disabled fields from PodSpec related
+// to ProcMount only if it is not already used by the old spec
+func dropDisabledProcMountField(podSpec, oldPodSpec *api.PodSpec) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ProcMountType) && !procMountInUse(oldPodSpec) {
+		defaultProcMount := api.DefaultProcMount
+		VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+			if c.SecurityContext != nil && c.SecurityContext.ProcMount != nil {
+				// The ProcMount field was improperly forced to non-nil in 1.12.
+				// If the feature is disabled, and the existing object is not using any non-default values, and the ProcMount field is present in the incoming object, force to the default value.
+				// Note: we cannot force the field to nil when the feature is disabled because it causes a diff against previously persisted data.
+				c.SecurityContext.ProcMount = &defaultProcMount
+			}
+			return true
+		})
+	}
+}
+
+func dropDisabledFSGroupFields(podSpec, oldPodSpec *api.PodSpec) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ConfigurableFSGroupPolicy) && !fsGroupPolicyInUse(oldPodSpec) {
+		// if oldPodSpec had no FSGroupChangePolicy set then we should prevent new pod from having this field
+		// if ConfigurableFSGroupPolicy feature is disabled
+		if podSpec.SecurityContext != nil {
+			podSpec.SecurityContext.FSGroupChangePolicy = nil
 		}
 	}
+}
+
+// dropDisabledCSIVolumeSourceAlphaFields removes disabled alpha fields from []CSIVolumeSource.
+// This should be called from PrepareForCreate/PrepareForUpdate for all pod specs resources containing a CSIVolumeSource
+func dropDisabledCSIVolumeSourceAlphaFields(podSpec, oldPodSpec *api.PodSpec) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume) && !csiInUse(oldPodSpec) {
+		for i := range podSpec.Volumes {
+			podSpec.Volumes[i].CSI = nil
+		}
+	}
+}
+
+// dropDisabledEphemeralVolumeSourceAlphaFields removes disabled alpha fields from []EphemeralVolumeSource.
+// This should be called from PrepareForCreate/PrepareForUpdate for all pod specs resources containing a EphemeralVolumeSource
+func dropDisabledEphemeralVolumeSourceAlphaFields(podSpec, oldPodSpec *api.PodSpec) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.GenericEphemeralVolume) && !csiInUse(oldPodSpec) {
+		for i := range podSpec.Volumes {
+			podSpec.Volumes[i].Ephemeral = nil
+		}
+	}
+}
+
+func ephemeralContainersInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	return len(podSpec.EphemeralContainers) > 0
+}
+
+func fsGroupPolicyInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	securityContext := podSpec.SecurityContext
+	if securityContext != nil && securityContext.FSGroupChangePolicy != nil {
+		return true
+	}
+	return false
+}
+
+// subpathInUse returns true if the pod spec is non-nil and has a volume mount that makes use of the subPath feature
+func subpathInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+
+	var inUse bool
+	VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+		for i := range c.VolumeMounts {
+			if len(c.VolumeMounts[i].SubPath) > 0 {
+				inUse = true
+				return false
+			}
+		}
+		return true
+	})
+
+	return inUse
+}
+
+// runtimeClassInUse returns true if the pod spec is non-nil and has a RuntimeClassName set
+func runtimeClassInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	if podSpec.RuntimeClassName != nil {
+		return true
+	}
+	return false
+}
+
+// overheadInUse returns true if the pod spec is non-nil and has Overhead set
+func overheadInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	if podSpec.Overhead != nil {
+		return true
+	}
+	return false
+}
+
+// procMountInUse returns true if the pod spec is non-nil and has a SecurityContext's ProcMount field set to a non-default value
+func procMountInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+
+	var inUse bool
+	VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+		if c.SecurityContext == nil || c.SecurityContext.ProcMount == nil {
+			return true
+		}
+		if *c.SecurityContext.ProcMount != api.DefaultProcMount {
+			inUse = true
+			return false
+		}
+		return true
+	})
+
+	return inUse
+}
+
+// appArmorInUse returns true if the pod has apparmor related information
+func appArmorInUse(podAnnotations map[string]string) bool {
+	for k := range podAnnotations {
+		if strings.HasPrefix(k, v1.AppArmorBetaContainerAnnotationKeyPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func tokenRequestProjectionInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	for _, v := range podSpec.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+		for _, s := range v.Projected.Sources {
+			if s.ServiceAccountToken != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// podPriorityInUse returns true if the pod spec is non-nil and has Priority or PriorityClassName set.
+func podPriorityInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	if podSpec.Priority != nil || podSpec.PriorityClassName != "" {
+		return true
+	}
+	return false
+}
+
+func sysctlsInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	if podSpec.SecurityContext != nil && podSpec.SecurityContext.Sysctls != nil {
+		return true
+	}
+	return false
+}
+
+// emptyDirSizeLimitInUse returns true if any pod's EmptyDir volumes use SizeLimit.
+func emptyDirSizeLimitInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	for i := range podSpec.Volumes {
+		if podSpec.Volumes[i].EmptyDir != nil {
+			if podSpec.Volumes[i].EmptyDir.SizeLimit != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// runAsGroupInUse returns true if the pod spec is non-nil and has a SecurityContext's RunAsGroup field set
+func runAsGroupInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+
+	if podSpec.SecurityContext != nil && podSpec.SecurityContext.RunAsGroup != nil {
+		return true
+	}
+
+	var inUse bool
+	VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+		if c.SecurityContext != nil && c.SecurityContext.RunAsGroup != nil {
+			inUse = true
+			return false
+		}
+		return true
+	})
+
+	return inUse
+}
+
+// subpathExprInUse returns true if the pod spec is non-nil and has a volume mount that makes use of the subPathExpr feature
+func subpathExprInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+
+	var inUse bool
+	VisitContainers(podSpec, AllContainers, func(c *api.Container, containerType ContainerType) bool {
+		for i := range c.VolumeMounts {
+			if len(c.VolumeMounts[i].SubPathExpr) > 0 {
+				inUse = true
+				return false
+			}
+		}
+		return true
+	})
+
+	return inUse
+}
+
+// csiInUse returns true if any pod's spec include inline CSI volumes.
+func csiInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	for i := range podSpec.Volumes {
+		if podSpec.Volumes[i].CSI != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// podPriorityInUse returns true if status is not nil and number of PodIPs is greater than one
+func multiplePodIPsInUse(podStatus *api.PodStatus) bool {
+	if podStatus == nil {
+		return false
+	}
+	if len(podStatus.PodIPs) > 1 {
+		return true
+	}
+	return false
+}
+
+// setHostnameAsFQDNInUse returns true if any pod's spec defines setHostnameAsFQDN field.
+func setHostnameAsFQDNInUse(podSpec *api.PodSpec) bool {
+	if podSpec == nil || podSpec.SetHostnameAsFQDN == nil {
+		return false
+	}
+	return *podSpec.SetHostnameAsFQDN
+}
+
+// SeccompAnnotationForField takes a pod seccomp profile field and returns the
+// converted annotation value
+func SeccompAnnotationForField(field *api.SeccompProfile) string {
+	// If only seccomp fields are specified, add the corresponding annotations.
+	// This ensures that the fields are enforced even if the node version
+	// trails the API version
+	switch field.Type {
+	case api.SeccompProfileTypeUnconfined:
+		return v1.SeccompProfileNameUnconfined
+
+	case api.SeccompProfileTypeRuntimeDefault:
+		return v1.SeccompProfileRuntimeDefault
+
+	case api.SeccompProfileTypeLocalhost:
+		if field.LocalhostProfile != nil {
+			return v1.SeccompLocalhostProfileNamePrefix + *field.LocalhostProfile
+		}
+	}
+
+	// we can only reach this code path if the LocalhostProfile is nil but the
+	// provided field type is SeccompProfileTypeLocalhost or if an unrecognized
+	// type is specified
+	return ""
+}
+
+// SeccompFieldForAnnotation takes a pod annotation and returns the converted
+// seccomp profile field.
+func SeccompFieldForAnnotation(annotation string) *api.SeccompProfile {
+	// If only seccomp annotations are specified, copy the values into the
+	// corresponding fields. This ensures that existing applications continue
+	// to enforce seccomp, and prevents the kubelet from needing to resolve
+	// annotations & fields.
+	if annotation == v1.SeccompProfileNameUnconfined {
+		return &api.SeccompProfile{Type: api.SeccompProfileTypeUnconfined}
+	}
+
+	if annotation == api.SeccompProfileRuntimeDefault || annotation == api.DeprecatedSeccompProfileDockerDefault {
+		return &api.SeccompProfile{Type: api.SeccompProfileTypeRuntimeDefault}
+	}
+
+	if strings.HasPrefix(annotation, v1.SeccompLocalhostProfileNamePrefix) {
+		localhostProfile := strings.TrimPrefix(annotation, v1.SeccompLocalhostProfileNamePrefix)
+		if localhostProfile != "" {
+			return &api.SeccompProfile{
+				Type:             api.SeccompProfileTypeLocalhost,
+				LocalhostProfile: &localhostProfile,
+			}
+		}
+	}
+
+	// we can only reach this code path if the localhostProfile name has a zero
+	// length or if the annotation has an unrecognized value
+	return nil
 }

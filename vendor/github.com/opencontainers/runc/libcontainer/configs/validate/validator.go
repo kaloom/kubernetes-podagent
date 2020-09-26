@@ -1,12 +1,14 @@
 package validate
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/intelrdt"
 	selinux "github.com/opencontainers/selinux/go-selinux"
 )
 
@@ -37,11 +39,17 @@ func (v *ConfigValidator) Validate(config *configs.Config) error {
 	if err := v.usernamespace(config); err != nil {
 		return err
 	}
+	if err := v.cgroupnamespace(config); err != nil {
+		return err
+	}
 	if err := v.sysctl(config); err != nil {
 		return err
 	}
-	if config.Rootless {
-		if err := v.rootless(config); err != nil {
+	if err := v.intelrdt(config); err != nil {
+		return err
+	}
+	if config.RootlessEUID {
+		if err := v.rootlessEUID(config); err != nil {
 			return err
 		}
 	}
@@ -73,7 +81,7 @@ func (v *ConfigValidator) rootfs(config *configs.Config) error {
 func (v *ConfigValidator) network(config *configs.Config) error {
 	if !config.Namespaces.Contains(configs.NEWNET) {
 		if len(config.Networks) > 0 || len(config.Routes) > 0 {
-			return fmt.Errorf("unable to apply network settings without a private NET namespace")
+			return errors.New("unable to apply network settings without a private NET namespace")
 		}
 	}
 	return nil
@@ -81,7 +89,7 @@ func (v *ConfigValidator) network(config *configs.Config) error {
 
 func (v *ConfigValidator) hostname(config *configs.Config) error {
 	if config.Hostname != "" && !config.Namespaces.Contains(configs.NEWUTS) {
-		return fmt.Errorf("unable to set hostname without a private UTS namespace")
+		return errors.New("unable to set hostname without a private UTS namespace")
 	}
 	return nil
 }
@@ -90,10 +98,10 @@ func (v *ConfigValidator) security(config *configs.Config) error {
 	// restrict sys without mount namespace
 	if (len(config.MaskPaths) > 0 || len(config.ReadonlyPaths) > 0) &&
 		!config.Namespaces.Contains(configs.NEWNS) {
-		return fmt.Errorf("unable to restrict sys entries without a private MNT namespace")
+		return errors.New("unable to restrict sys entries without a private MNT namespace")
 	}
 	if config.ProcessLabel != "" && !selinux.GetEnabled() {
-		return fmt.Errorf("selinux label is specified in config, but selinux is disabled or not supported")
+		return errors.New("selinux label is specified in config, but selinux is disabled or not supported")
 	}
 
 	return nil
@@ -102,11 +110,20 @@ func (v *ConfigValidator) security(config *configs.Config) error {
 func (v *ConfigValidator) usernamespace(config *configs.Config) error {
 	if config.Namespaces.Contains(configs.NEWUSER) {
 		if _, err := os.Stat("/proc/self/ns/user"); os.IsNotExist(err) {
-			return fmt.Errorf("USER namespaces aren't enabled in the kernel")
+			return errors.New("USER namespaces aren't enabled in the kernel")
 		}
 	} else {
 		if config.UidMappings != nil || config.GidMappings != nil {
-			return fmt.Errorf("User namespace mappings specified, but USER namespace isn't enabled in the config")
+			return errors.New("User namespace mappings specified, but USER namespace isn't enabled in the config")
+		}
+	}
+	return nil
+}
+
+func (v *ConfigValidator) cgroupnamespace(config *configs.Config) error {
+	if config.Namespaces.Contains(configs.NEWCGROUP) {
+		if _, err := os.Stat("/proc/self/ns/cgroup"); os.IsNotExist(err) {
+			return errors.New("cgroup namespaces aren't enabled in the kernel")
 		}
 	}
 	return nil
@@ -147,7 +164,41 @@ func (v *ConfigValidator) sysctl(config *configs.Config) error {
 				return fmt.Errorf("sysctl %q is not allowed in the hosts network namespace", s)
 			}
 		}
+		if config.Namespaces.Contains(configs.NEWUTS) {
+			switch s {
+			case "kernel.domainname":
+				// This is namespaced and there's no explicit OCI field for it.
+				continue
+			case "kernel.hostname":
+				// This is namespaced but there's a conflicting (dedicated) OCI field for it.
+				return fmt.Errorf("sysctl %q is not allowed as it conflicts with the OCI %q field", s, "hostname")
+			}
+		}
 		return fmt.Errorf("sysctl %q is not in a separate kernel namespace", s)
+	}
+
+	return nil
+}
+
+func (v *ConfigValidator) intelrdt(config *configs.Config) error {
+	if config.IntelRdt != nil {
+		if !intelrdt.IsCatEnabled() && !intelrdt.IsMbaEnabled() {
+			return errors.New("intelRdt is specified in config, but Intel RDT is not supported or enabled")
+		}
+
+		if !intelrdt.IsCatEnabled() && config.IntelRdt.L3CacheSchema != "" {
+			return errors.New("intelRdt.l3CacheSchema is specified in config, but Intel RDT/CAT is not enabled")
+		}
+		if !intelrdt.IsMbaEnabled() && config.IntelRdt.MemBwSchema != "" {
+			return errors.New("intelRdt.memBwSchema is specified in config, but Intel RDT/MBA is not enabled")
+		}
+
+		if intelrdt.IsCatEnabled() && config.IntelRdt.L3CacheSchema == "" {
+			return errors.New("Intel RDT/CAT is enabled and intelRdt is specified in config, but intelRdt.l3CacheSchema is empty")
+		}
+		if intelrdt.IsMbaEnabled() && config.IntelRdt.MemBwSchema == "" {
+			return errors.New("Intel RDT/MBA is enabled and intelRdt is specified in config, but intelRdt.memBwSchema is empty")
+		}
 	}
 
 	return nil

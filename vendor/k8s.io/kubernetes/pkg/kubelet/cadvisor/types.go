@@ -28,6 +28,7 @@ type Interface interface {
 	DockerContainer(name string, req *cadvisorapi.ContainerInfoRequest) (cadvisorapi.ContainerInfo, error)
 	ContainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (*cadvisorapi.ContainerInfo, error)
 	ContainerInfoV2(name string, options cadvisorapiv2.RequestOptions) (map[string]cadvisorapiv2.ContainerInfo, error)
+	GetRequestedContainersInfo(containerName string, options cadvisorapiv2.RequestOptions) (map[string]*cadvisorapi.ContainerInfo, error)
 	SubcontainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (map[string]*cadvisorapi.ContainerInfo, error)
 	MachineInfo() (*cadvisorapi.MachineInfo, error)
 
@@ -42,12 +43,8 @@ type Interface interface {
 	// Get events streamed through passedChannel that fit the request.
 	WatchEvents(request *events.Request) (*events.EventChannel, error)
 
-	// HasDedicatedImageFs returns true iff a dedicated image filesystem exists for storing images.
-	HasDedicatedImageFs() (bool, error)
-
-	// GetFsInfoByFsUUID returns the stats of the filesystem with the specified
-	// uuid.
-	GetFsInfoByFsUUID(uuid string) (cadvisorapiv2.FsInfo, error)
+	// Get filesystem information for the filesystem that contains the given file.
+	GetDirFsInfo(path string) (cadvisorapiv2.FsInfo, error)
 }
 
 // ImageFsInfoProvider informs cAdvisor how to find imagefs for container images.

@@ -55,7 +55,7 @@ type Manager interface {
 	// whether the pod is found.
 	GetPodByUID(types.UID) (*v1.Pod, bool)
 	// GetPodByMirrorPod returns the static pod for the given mirror pod and
-	// whether it was known to the pod manger.
+	// whether it was known to the pod manager.
 	GetPodByMirrorPod(*v1.Pod) (*v1.Pod, bool)
 	// GetMirrorPodByPod returns the mirror pod for the given static pod and
 	// whether it was known to the pod manager.
@@ -73,10 +73,8 @@ type Manager interface {
 	// this means deleting the mappings related to mirror pods.  For non-
 	// mirror pods, this means deleting from indexes for all non-mirror pods.
 	DeletePod(pod *v1.Pod)
-	// DeleteOrphanedMirrorPods deletes all mirror pods which do not have
-	// associated static pods. This method sends deletion requests to the API
-	// server, but does NOT modify the internal pod storage in basicManager.
-	DeleteOrphanedMirrorPods()
+	// GetOrphanedMirrorPodNames returns names of orphaned mirror pods
+	GetOrphanedMirrorPodNames() []string
 	// TranslatePodUID returns the actual UID of a pod. If the UID belongs to
 	// a mirror pod, returns the UID of its static pod. Otherwise, returns the
 	// original UID.
@@ -157,25 +155,45 @@ func (pm *basicManager) UpdatePod(pod *v1.Pod) {
 	pm.updatePodsInternal(pod)
 }
 
+func isPodInTerminatedState(pod *v1.Pod) bool {
+	return pod.Status.Phase == v1.PodFailed || pod.Status.Phase == v1.PodSucceeded
+}
+
 // updatePodsInternal replaces the given pods in the current state of the
 // manager, updating the various indices. The caller is assumed to hold the
 // lock.
 func (pm *basicManager) updatePodsInternal(pods ...*v1.Pod) {
 	for _, pod := range pods {
 		if pm.secretManager != nil {
-			// TODO: Consider detecting only status update and in such case do
-			// not register pod, as it doesn't really matter.
-			pm.secretManager.RegisterPod(pod)
+			if isPodInTerminatedState(pod) {
+				// Pods that are in terminated state and no longer running can be
+				// ignored as they no longer require access to secrets.
+				// It is especially important in watch-based manager, to avoid
+				// unnecessary watches for terminated pods waiting for GC.
+				pm.secretManager.UnregisterPod(pod)
+			} else {
+				// TODO: Consider detecting only status update and in such case do
+				// not register pod, as it doesn't really matter.
+				pm.secretManager.RegisterPod(pod)
+			}
 		}
 		if pm.configMapManager != nil {
-			// TODO: Consider detecting only status update and in such case do
-			// not register pod, as it doesn't really matter.
-			pm.configMapManager.RegisterPod(pod)
+			if isPodInTerminatedState(pod) {
+				// Pods that are in terminated state and no longer running can be
+				// ignored as they no longer require access to configmaps.
+				// It is especially important in watch-based manager, to avoid
+				// unnecessary watches for terminated pods waiting for GC.
+				pm.configMapManager.UnregisterPod(pod)
+			} else {
+				// TODO: Consider detecting only status update and in such case do
+				// not register pod, as it doesn't really matter.
+				pm.configMapManager.RegisterPod(pod)
+			}
 		}
 		podFullName := kubecontainer.GetPodFullName(pod)
 		// This logic relies on a static pod and its mirror to have the same name.
 		// It is safe to type convert here due to the IsMirrorPod guard.
-		if IsMirrorPod(pod) {
+		if kubetypes.IsMirrorPod(pod) {
 			mirrorPodUID := kubetypes.MirrorPodUID(pod.UID)
 			pm.mirrorPodByUID[mirrorPodUID] = pod
 			pm.mirrorPodByFullName[podFullName] = pod
@@ -204,7 +222,7 @@ func (pm *basicManager) DeletePod(pod *v1.Pod) {
 	}
 	podFullName := kubecontainer.GetPodFullName(pod)
 	// It is safe to type convert here due to the IsMirrorPod guard.
-	if IsMirrorPod(pod) {
+	if kubetypes.IsMirrorPod(pod) {
 		mirrorPodUID := kubetypes.MirrorPodUID(pod.UID)
 		delete(pm.mirrorPodByUID, mirrorPodUID)
 		delete(pm.mirrorPodByFullName, podFullName)
@@ -271,7 +289,7 @@ func (pm *basicManager) GetUIDTranslations() (podToMirror map[kubetypes.Resolved
 	mirrorToPod = make(map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID, len(pm.translationByUID))
 	// Insert empty translation mapping for all static pods.
 	for uid, pod := range pm.podByUID {
-		if !IsStaticPod(pod) {
+		if !kubetypes.IsStaticPod(pod) {
 			continue
 		}
 		podToMirror[uid] = ""
@@ -287,7 +305,7 @@ func (pm *basicManager) GetUIDTranslations() (podToMirror map[kubetypes.Resolved
 	return podToMirror, mirrorToPod
 }
 
-func (pm *basicManager) getOrphanedMirrorPodNames() []string {
+func (pm *basicManager) GetOrphanedMirrorPodNames() []string {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
 	var podFullNames []string
@@ -297,13 +315,6 @@ func (pm *basicManager) getOrphanedMirrorPodNames() []string {
 		}
 	}
 	return podFullNames
-}
-
-func (pm *basicManager) DeleteOrphanedMirrorPods() {
-	podFullNames := pm.getOrphanedMirrorPodNames()
-	for _, podFullName := range podFullNames {
-		pm.MirrorClient.DeleteMirrorPod(podFullName)
-	}
 }
 
 func (pm *basicManager) IsMirrorPodOf(mirrorPod, pod *v1.Pod) bool {

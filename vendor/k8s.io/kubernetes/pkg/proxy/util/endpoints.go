@@ -19,8 +19,9 @@ package util
 import (
 	"fmt"
 	"net"
+	"strconv"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 // IPPart returns just the IP part of an IP or IP:port or endpoint string. If the IP
@@ -32,12 +33,34 @@ func IPPart(s string) string {
 		return s
 	}
 	// Must be IP:port
-	ip, _, err := net.SplitHostPort(s)
+	host, _, err := net.SplitHostPort(s)
 	if err != nil {
-		glog.Errorf("Error parsing '%s': %v", s, err)
+		klog.Errorf("Error parsing '%s': %v", s, err)
 		return ""
 	}
-	return ip
+	// Check if host string is a valid IP address
+	ip := net.ParseIP(host)
+	if ip == nil {
+		klog.Errorf("invalid IP part '%s'", host)
+		return ""
+	}
+	return ip.String()
+}
+
+// PortPart returns just the port part of an endpoint string.
+func PortPart(s string) (int, error) {
+	// Must be IP:port
+	_, port, err := net.SplitHostPort(s)
+	if err != nil {
+		klog.Errorf("Error parsing '%s': %v", s, err)
+		return -1, err
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil {
+		klog.Errorf("Error parsing '%s': %v", port, err)
+		return -1, err
+	}
+	return portNumber, nil
 }
 
 // ToCIDR returns a host address of the form <ip-address>/32 for

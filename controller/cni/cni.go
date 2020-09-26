@@ -18,6 +18,7 @@ limitations under the License.
 package cni
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -27,7 +28,7 @@ import (
 	"github.com/containernetworking/cni/libcni"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/kubelet/network"
+	"k8s.io/kubernetes/pkg/kubelet/dockershim/network"
 	utilexec "k8s.io/utils/exec"
 )
 
@@ -207,7 +208,7 @@ func (plugin *NetworkPlugin) addToNetwork(network *cniNetwork, cniParams *Parame
 
 	netConf, cniNet := network.NetworkConfig, network.CNIConfig
 	glog.V(4).Infof("About to add CNI network %v (type=%v)", cniParams.NetworkName, netConf.Plugins[0].Network.Type)
-	res, err := cniNet.AddNetworkList(netConf, rt)
+	res, err := cniNet.AddNetworkList(context.Background(), netConf, rt)
 	if err != nil {
 		glog.Errorf("Error adding network: %v", err)
 		return nil, err
@@ -225,7 +226,7 @@ func (plugin *NetworkPlugin) deleteFromNetwork(network *cniNetwork, cniParams *P
 
 	netConf, cniNet := network.NetworkConfig, network.CNIConfig
 	glog.V(4).Infof("About to del CNI network %v (type=%v)", cniParams.NetworkName, netConf.Plugins[0].Network.Type)
-	err = cniNet.DelNetworkList(netConf, rt)
+	err = cniNet.DelNetworkList(context.Background(), netConf, rt)
 	if err != nil {
 		glog.Errorf("Error deleting network: %v", err)
 		return err

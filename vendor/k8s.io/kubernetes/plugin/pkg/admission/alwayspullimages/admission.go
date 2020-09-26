@@ -25,29 +25,40 @@ limitations under the License.
 package alwayspullimages
 
 import (
+	"context"
 	"io"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/kubernetes/pkg/api"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/pods"
 )
+
+// PluginName indicates name of admission plugin.
+const PluginName = "AlwaysPullImages"
 
 // Register registers a plugin
 func Register(plugins *admission.Plugins) {
-	plugins.Register("AlwaysPullImages", func(config io.Reader) (admission.Interface, error) {
+	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
 		return NewAlwaysPullImages(), nil
 	})
 }
 
-// alwaysPullImages is an implementation of admission.Interface.
+// AlwaysPullImages is an implementation of admission.Interface.
 // It looks at all new pods and overrides each container's image pull policy to Always.
-type alwaysPullImages struct {
+type AlwaysPullImages struct {
 	*admission.Handler
 }
 
-func (a *alwaysPullImages) Admit(attributes admission.Attributes) (err error) {
+var _ admission.MutationInterface = &AlwaysPullImages{}
+var _ admission.ValidationInterface = &AlwaysPullImages{}
+
+// Admit makes an admission decision based on the request attributes
+func (a *AlwaysPullImages) Admit(ctx context.Context, attributes admission.Attributes, o admission.ObjectInterfaces) (err error) {
 	// Ignore all calls to subresources or resources other than pods.
-	if len(attributes.GetSubresource()) != 0 || attributes.GetResource().GroupResource() != api.Resource("pods") {
+	if shouldIgnore(attributes) {
 		return nil
 	}
 	pod, ok := attributes.GetObject().(*api.Pod)
@@ -55,20 +66,53 @@ func (a *alwaysPullImages) Admit(attributes admission.Attributes) (err error) {
 		return apierrors.NewBadRequest("Resource was marked with kind Pod but was unable to be converted")
 	}
 
-	for i := range pod.Spec.InitContainers {
-		pod.Spec.InitContainers[i].ImagePullPolicy = api.PullAlways
+	pods.VisitContainersWithPath(&pod.Spec, field.NewPath("spec"), func(c *api.Container, _ *field.Path) bool {
+		c.ImagePullPolicy = api.PullAlways
+		return true
+	})
+
+	return nil
+}
+
+// Validate makes sure that all containers are set to always pull images
+func (*AlwaysPullImages) Validate(ctx context.Context, attributes admission.Attributes, o admission.ObjectInterfaces) (err error) {
+	if shouldIgnore(attributes) {
+		return nil
 	}
 
-	for i := range pod.Spec.Containers {
-		pod.Spec.Containers[i].ImagePullPolicy = api.PullAlways
+	pod, ok := attributes.GetObject().(*api.Pod)
+	if !ok {
+		return apierrors.NewBadRequest("Resource was marked with kind Pod but was unable to be converted")
+	}
+
+	var allErrs []error
+	pods.VisitContainersWithPath(&pod.Spec, field.NewPath("spec"), func(c *api.Container, p *field.Path) bool {
+		if c.ImagePullPolicy != api.PullAlways {
+			allErrs = append(allErrs, admission.NewForbidden(attributes,
+				field.NotSupported(p.Child("imagePullPolicy"), c.ImagePullPolicy, []string{string(api.PullAlways)}),
+			))
+		}
+		return true
+	})
+	if len(allErrs) > 0 {
+		return utilerrors.NewAggregate(allErrs)
 	}
 
 	return nil
 }
 
+func shouldIgnore(attributes admission.Attributes) bool {
+	// Ignore all calls to subresources or resources other than pods.
+	if len(attributes.GetSubresource()) != 0 || attributes.GetResource().GroupResource() != api.Resource("pods") {
+		return true
+	}
+
+	return false
+}
+
 // NewAlwaysPullImages creates a new always pull images admission control handler
-func NewAlwaysPullImages() admission.Interface {
-	return &alwaysPullImages{
+func NewAlwaysPullImages() *AlwaysPullImages {
+	return &AlwaysPullImages{
 		Handler: admission.NewHandler(admission.Create, admission.Update),
 	}
 }

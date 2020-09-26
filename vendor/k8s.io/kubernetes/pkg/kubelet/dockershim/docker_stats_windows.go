@@ -1,4 +1,4 @@
-// +build windows
+// +build windows,!dockerless
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -19,50 +19,38 @@ limitations under the License.
 package dockershim
 
 import (
+	"context"
 	"time"
 
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
+	"github.com/Microsoft/hcsshim"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/klog/v2"
 )
 
-// ContainerStats returns stats for a container stats request based on container id.
-func (ds *dockerService) ContainerStats(containerID string) (*runtimeapi.ContainerStats, error) {
-	containerStats, err := ds.getContainerStats(containerID)
-	if err != nil {
-		return nil, err
-	}
-	return containerStats, nil
-}
-
-// ListContainerStats returns stats for a list container stats request based on a filter.
-func (ds *dockerService) ListContainerStats(containerStatsFilter *runtimeapi.ContainerStatsFilter) ([]*runtimeapi.ContainerStats, error) {
-	filter := &runtimeapi.ContainerFilter{}
-
-	if containerStatsFilter != nil {
-		filter.Id = containerStatsFilter.Id
-		filter.PodSandboxId = containerStatsFilter.PodSandboxId
-		filter.LabelSelector = containerStatsFilter.LabelSelector
-	}
-
-	containers, err := ds.ListContainers(filter)
-	if err != nil {
-		return nil, err
-	}
-
-	var stats []*runtimeapi.ContainerStats
-	for _, container := range containers {
-		containerStats, err := ds.getContainerStats(container.Id)
-		if err != nil {
-			return nil, err
-		}
-
-		stats = append(stats, containerStats)
-	}
-
-	return stats, nil
-}
-
 func (ds *dockerService) getContainerStats(containerID string) (*runtimeapi.ContainerStats, error) {
-	statsJSON, err := ds.client.GetContainerStats(containerID)
+	info, err := ds.client.Info()
+	if err != nil {
+		return nil, err
+	}
+
+	hcsshimContainer, err := hcsshim.OpenContainer(containerID)
+	if err != nil {
+		// As we moved from using Docker stats to hcsshim directly, we may query HCS with already exited container IDs.
+		// That will typically happen with init-containers in Exited state. Docker still knows about them but the HCS does not.
+		// As we don't want to block stats retrieval for other containers, we only log errors.
+		if !hcsshim.IsNotExist(err) && !hcsshim.IsAlreadyStopped(err) {
+			klog.Errorf("Error opening container (stats will be missing) '%s': %v", containerID, err)
+		}
+		return nil, nil
+	}
+	defer func() {
+		closeErr := hcsshimContainer.Close()
+		if closeErr != nil {
+			klog.Errorf("Error closing container '%s': %v", containerID, closeErr)
+		}
+	}()
+
+	stats, err := hcsshimContainer.Statistics()
 	if err != nil {
 		return nil, err
 	}
@@ -72,12 +60,12 @@ func (ds *dockerService) getContainerStats(containerID string) (*runtimeapi.Cont
 		return nil, err
 	}
 
-	status, err := ds.ContainerStatus(containerID)
+	statusResp, err := ds.ContainerStatus(context.Background(), &runtimeapi.ContainerStatusRequest{ContainerId: containerID})
 	if err != nil {
 		return nil, err
 	}
+	status := statusResp.GetStatus()
 
-	dockerStats := statsJSON.Stats
 	timestamp := time.Now().UnixNano()
 	containerStats := &runtimeapi.ContainerStats{
 		Attributes: &runtimeapi.ContainerAttributes{
@@ -88,16 +76,16 @@ func (ds *dockerService) getContainerStats(containerID string) (*runtimeapi.Cont
 		},
 		Cpu: &runtimeapi.CpuUsage{
 			Timestamp: timestamp,
-			// have to multiply cpu usage by 100 since docker stats units is in 100's of nano seconds for Windows
-			// see https://github.com/moby/moby/blob/v1.13.1/api/types/stats.go#L22
-			UsageCoreNanoSeconds: &runtimeapi.UInt64Value{Value: dockerStats.CPUStats.CPUUsage.TotalUsage * 100},
+			// have to multiply cpu usage by 100 since stats units is in 100's of nano seconds for Windows
+			UsageCoreNanoSeconds: &runtimeapi.UInt64Value{Value: stats.Processor.TotalRuntime100ns * 100},
 		},
 		Memory: &runtimeapi.MemoryUsage{
 			Timestamp:       timestamp,
-			WorkingSetBytes: &runtimeapi.UInt64Value{Value: dockerStats.MemoryStats.PrivateWorkingSet},
+			WorkingSetBytes: &runtimeapi.UInt64Value{Value: stats.Memory.UsagePrivateWorkingSetBytes},
 		},
 		WritableLayer: &runtimeapi.FilesystemUsage{
 			Timestamp: timestamp,
+			FsId:      &runtimeapi.FilesystemIdentifier{Mountpoint: info.DockerRootDir},
 			UsedBytes: &runtimeapi.UInt64Value{Value: uint64(*containerJSON.SizeRw)},
 		},
 	}

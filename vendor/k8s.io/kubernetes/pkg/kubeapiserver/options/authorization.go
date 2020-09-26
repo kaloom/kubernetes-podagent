@@ -17,79 +17,115 @@ limitations under the License.
 package options
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/spf13/pflag"
 
-	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
+	"k8s.io/apimachinery/pkg/util/sets"
+	versionedinformers "k8s.io/client-go/informers"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer"
 	authzmodes "k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 )
 
+// BuiltInAuthorizationOptions contains all build-in authorization options for API Server
 type BuiltInAuthorizationOptions struct {
-	Mode                        string
+	Modes                       []string
 	PolicyFile                  string
 	WebhookConfigFile           string
+	WebhookVersion              string
 	WebhookCacheAuthorizedTTL   time.Duration
 	WebhookCacheUnauthorizedTTL time.Duration
 }
 
+// NewBuiltInAuthorizationOptions create a BuiltInAuthorizationOptions with default value
 func NewBuiltInAuthorizationOptions() *BuiltInAuthorizationOptions {
 	return &BuiltInAuthorizationOptions{
-		Mode: authzmodes.ModeAlwaysAllow,
+		Modes:                       []string{authzmodes.ModeAlwaysAllow},
+		WebhookVersion:              "v1beta1",
 		WebhookCacheAuthorizedTTL:   5 * time.Minute,
 		WebhookCacheUnauthorizedTTL: 30 * time.Second,
 	}
 }
 
-func (s *BuiltInAuthorizationOptions) Validate() []error {
+// Validate checks invalid config combination
+func (o *BuiltInAuthorizationOptions) Validate() []error {
+	if o == nil {
+		return nil
+	}
 	allErrors := []error{}
+
+	if len(o.Modes) == 0 {
+		allErrors = append(allErrors, fmt.Errorf("at least one authorization-mode must be passed"))
+	}
+
+	modes := sets.NewString(o.Modes...)
+	for _, mode := range o.Modes {
+		if !authzmodes.IsValidAuthorizationMode(mode) {
+			allErrors = append(allErrors, fmt.Errorf("authorization-mode %q is not a valid mode", mode))
+		}
+		if mode == authzmodes.ModeABAC {
+			if o.PolicyFile == "" {
+				allErrors = append(allErrors, fmt.Errorf("authorization-mode ABAC's authorization policy file not passed"))
+			}
+		}
+		if mode == authzmodes.ModeWebhook {
+			if o.WebhookConfigFile == "" {
+				allErrors = append(allErrors, fmt.Errorf("authorization-mode Webhook's authorization config file not passed"))
+			}
+		}
+	}
+
+	if o.PolicyFile != "" && !modes.Has(authzmodes.ModeABAC) {
+		allErrors = append(allErrors, fmt.Errorf("cannot specify --authorization-policy-file without mode ABAC"))
+	}
+
+	if o.WebhookConfigFile != "" && !modes.Has(authzmodes.ModeWebhook) {
+		allErrors = append(allErrors, fmt.Errorf("cannot specify --authorization-webhook-config-file without mode Webhook"))
+	}
+
+	if len(o.Modes) != len(modes.List()) {
+		allErrors = append(allErrors, fmt.Errorf("authorization-mode %q has mode specified more than once", o.Modes))
+	}
+
 	return allErrors
 }
 
-func (s *BuiltInAuthorizationOptions) AddFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&s.Mode, "authorization-mode", s.Mode, ""+
+// AddFlags returns flags of authorization for a API Server
+func (o *BuiltInAuthorizationOptions) AddFlags(fs *pflag.FlagSet) {
+	fs.StringSliceVar(&o.Modes, "authorization-mode", o.Modes, ""+
 		"Ordered list of plug-ins to do authorization on secure port. Comma-delimited list of: "+
 		strings.Join(authzmodes.AuthorizationModeChoices, ",")+".")
 
-	fs.StringVar(&s.PolicyFile, "authorization-policy-file", s.PolicyFile, ""+
-		"File with authorization policy in csv format, used with --authorization-mode=ABAC, on the secure port.")
+	fs.StringVar(&o.PolicyFile, "authorization-policy-file", o.PolicyFile, ""+
+		"File with authorization policy in json line by line format, used with --authorization-mode=ABAC, on the secure port.")
 
-	fs.StringVar(&s.WebhookConfigFile, "authorization-webhook-config-file", s.WebhookConfigFile, ""+
+	fs.StringVar(&o.WebhookConfigFile, "authorization-webhook-config-file", o.WebhookConfigFile, ""+
 		"File with webhook configuration in kubeconfig format, used with --authorization-mode=Webhook. "+
 		"The API server will query the remote service to determine access on the API server's secure port.")
 
-	fs.DurationVar(&s.WebhookCacheAuthorizedTTL, "authorization-webhook-cache-authorized-ttl",
-		s.WebhookCacheAuthorizedTTL,
+	fs.StringVar(&o.WebhookVersion, "authorization-webhook-version", o.WebhookVersion, ""+
+		"The API version of the authorization.k8s.io SubjectAccessReview to send to and expect from the webhook.")
+
+	fs.DurationVar(&o.WebhookCacheAuthorizedTTL, "authorization-webhook-cache-authorized-ttl",
+		o.WebhookCacheAuthorizedTTL,
 		"The duration to cache 'authorized' responses from the webhook authorizer.")
 
-	fs.DurationVar(&s.WebhookCacheUnauthorizedTTL,
-		"authorization-webhook-cache-unauthorized-ttl", s.WebhookCacheUnauthorizedTTL,
+	fs.DurationVar(&o.WebhookCacheUnauthorizedTTL,
+		"authorization-webhook-cache-unauthorized-ttl", o.WebhookCacheUnauthorizedTTL,
 		"The duration to cache 'unauthorized' responses from the webhook authorizer.")
-
-	fs.String("authorization-rbac-super-user", "", ""+
-		"If specified, a username which avoids RBAC authorization checks and role binding "+
-		"privilege escalation checks, to be used with --authorization-mode=RBAC.")
-	fs.MarkDeprecated("authorization-rbac-super-user", "Removed during alpha to beta.  The 'system:masters' group has privileged access.")
-
 }
 
-func (s *BuiltInAuthorizationOptions) Modes() []string {
-	modes := []string{}
-	if len(s.Mode) > 0 {
-		modes = strings.Split(s.Mode, ",")
-	}
-	return modes
-}
-
-func (s *BuiltInAuthorizationOptions) ToAuthorizationConfig(informerFactory informers.SharedInformerFactory) authorizer.AuthorizationConfig {
-	return authorizer.AuthorizationConfig{
-		AuthorizationModes:          s.Modes(),
-		PolicyFile:                  s.PolicyFile,
-		WebhookConfigFile:           s.WebhookConfigFile,
-		WebhookCacheAuthorizedTTL:   s.WebhookCacheAuthorizedTTL,
-		WebhookCacheUnauthorizedTTL: s.WebhookCacheUnauthorizedTTL,
-		InformerFactory:             informerFactory,
+// ToAuthorizationConfig convert BuiltInAuthorizationOptions to authorizer.Config
+func (o *BuiltInAuthorizationOptions) ToAuthorizationConfig(versionedInformerFactory versionedinformers.SharedInformerFactory) authorizer.Config {
+	return authorizer.Config{
+		AuthorizationModes:          o.Modes,
+		PolicyFile:                  o.PolicyFile,
+		WebhookConfigFile:           o.WebhookConfigFile,
+		WebhookVersion:              o.WebhookVersion,
+		WebhookCacheAuthorizedTTL:   o.WebhookCacheAuthorizedTTL,
+		WebhookCacheUnauthorizedTTL: o.WebhookCacheUnauthorizedTTL,
+		VersionedInformerFactory:    versionedInformerFactory,
 	}
 }

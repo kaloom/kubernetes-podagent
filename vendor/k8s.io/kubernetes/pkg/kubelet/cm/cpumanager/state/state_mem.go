@@ -19,13 +19,13 @@ package state
 import (
 	"sync"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 )
 
 type stateMemory struct {
 	sync.RWMutex
-	assignments   map[string]cpuset.CPUSet
+	assignments   ContainerCPUAssignments
 	defaultCPUSet cpuset.CPUSet
 }
 
@@ -33,18 +33,18 @@ var _ State = &stateMemory{}
 
 // NewMemoryState creates new State for keeping track of cpu/pod assignment
 func NewMemoryState() State {
-	glog.Infof("[cpumanager] initializing new in-memory state store")
+	klog.Infof("[cpumanager] initializing new in-memory state store")
 	return &stateMemory{
-		assignments:   map[string]cpuset.CPUSet{},
+		assignments:   ContainerCPUAssignments{},
 		defaultCPUSet: cpuset.NewCPUSet(),
 	}
 }
 
-func (s *stateMemory) GetCPUSet(containerID string) (cpuset.CPUSet, bool) {
+func (s *stateMemory) GetCPUSet(podUID string, containerName string) (cpuset.CPUSet, bool) {
 	s.RLock()
 	defer s.RUnlock()
 
-	res, ok := s.assignments[containerID]
+	res, ok := s.assignments[podUID][containerName]
 	return res.Clone(), ok
 }
 
@@ -55,22 +55,29 @@ func (s *stateMemory) GetDefaultCPUSet() cpuset.CPUSet {
 	return s.defaultCPUSet.Clone()
 }
 
-func (s *stateMemory) GetCPUSetOrDefault(containerID string) cpuset.CPUSet {
-	s.RLock()
-	defer s.RUnlock()
-
-	if res, ok := s.GetCPUSet(containerID); ok {
+func (s *stateMemory) GetCPUSetOrDefault(podUID string, containerName string) cpuset.CPUSet {
+	if res, ok := s.GetCPUSet(podUID, containerName); ok {
 		return res
 	}
 	return s.GetDefaultCPUSet()
 }
 
-func (s *stateMemory) SetCPUSet(containerID string, cset cpuset.CPUSet) {
+func (s *stateMemory) GetCPUAssignments() ContainerCPUAssignments {
+	s.RLock()
+	defer s.RUnlock()
+	return s.assignments.Clone()
+}
+
+func (s *stateMemory) SetCPUSet(podUID string, containerName string, cset cpuset.CPUSet) {
 	s.Lock()
 	defer s.Unlock()
 
-	s.assignments[containerID] = cset
-	glog.Infof("[cpumanager] updated desired cpuset (container id: %s, cpuset: \"%s\")", containerID, cset)
+	if _, ok := s.assignments[podUID]; !ok {
+		s.assignments[podUID] = make(map[string]cpuset.CPUSet)
+	}
+
+	s.assignments[podUID][containerName] = cset
+	klog.Infof("[cpumanager] updated desired cpuset (pod: %s, container: %s, cpuset: \"%s\")", podUID, containerName, cset)
 }
 
 func (s *stateMemory) SetDefaultCPUSet(cset cpuset.CPUSet) {
@@ -78,13 +85,33 @@ func (s *stateMemory) SetDefaultCPUSet(cset cpuset.CPUSet) {
 	defer s.Unlock()
 
 	s.defaultCPUSet = cset
-	glog.Infof("[cpumanager] updated default cpuset: \"%s\"", cset)
+	klog.Infof("[cpumanager] updated default cpuset: \"%s\"", cset)
 }
 
-func (s *stateMemory) Delete(containerID string) {
+func (s *stateMemory) SetCPUAssignments(a ContainerCPUAssignments) {
 	s.Lock()
 	defer s.Unlock()
 
-	delete(s.assignments, containerID)
-	glog.V(2).Infof("[cpumanager] deleted cpuset assignment (container id: %s)", containerID)
+	s.assignments = a.Clone()
+	klog.Infof("[cpumanager] updated cpuset assignments: \"%v\"", a)
+}
+
+func (s *stateMemory) Delete(podUID string, containerName string) {
+	s.Lock()
+	defer s.Unlock()
+
+	delete(s.assignments[podUID], containerName)
+	if len(s.assignments[podUID]) == 0 {
+		delete(s.assignments, podUID)
+	}
+	klog.V(2).Infof("[cpumanager] deleted cpuset assignment (pod: %s, container: %s)", podUID, containerName)
+}
+
+func (s *stateMemory) ClearState() {
+	s.Lock()
+	defer s.Unlock()
+
+	s.defaultCPUSet = cpuset.CPUSet{}
+	s.assignments = make(ContainerCPUAssignments)
+	klog.V(2).Infof("[cpumanager] cleared state")
 }

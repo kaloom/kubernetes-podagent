@@ -17,18 +17,19 @@ limitations under the License.
 package reconciliation
 
 import (
+	"context"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/apis/rbac"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/rbac/internalversion"
+	rbacv1client "k8s.io/client-go/kubernetes/typed/rbac/v1"
 )
 
 // +k8s:deepcopy-gen=true
 // +k8s:deepcopy-gen:interfaces=k8s.io/kubernetes/pkg/registry/rbac/reconciliation.RoleBinding
 // +k8s:deepcopy-gen:nonpointer-interfaces=true
 type ClusterRoleBindingAdapter struct {
-	ClusterRoleBinding *rbac.ClusterRoleBinding
+	ClusterRoleBinding *rbacv1.ClusterRoleBinding
 }
 
 func (o ClusterRoleBindingAdapter) GetObject() runtime.Object {
@@ -63,24 +64,24 @@ func (o ClusterRoleBindingAdapter) SetAnnotations(in map[string]string) {
 	o.ClusterRoleBinding.Annotations = in
 }
 
-func (o ClusterRoleBindingAdapter) GetRoleRef() rbac.RoleRef {
+func (o ClusterRoleBindingAdapter) GetRoleRef() rbacv1.RoleRef {
 	return o.ClusterRoleBinding.RoleRef
 }
 
-func (o ClusterRoleBindingAdapter) GetSubjects() []rbac.Subject {
+func (o ClusterRoleBindingAdapter) GetSubjects() []rbacv1.Subject {
 	return o.ClusterRoleBinding.Subjects
 }
 
-func (o ClusterRoleBindingAdapter) SetSubjects(in []rbac.Subject) {
+func (o ClusterRoleBindingAdapter) SetSubjects(in []rbacv1.Subject) {
 	o.ClusterRoleBinding.Subjects = in
 }
 
 type ClusterRoleBindingClientAdapter struct {
-	Client internalversion.ClusterRoleBindingInterface
+	Client rbacv1client.ClusterRoleBindingInterface
 }
 
 func (c ClusterRoleBindingClientAdapter) Get(namespace, name string) (RoleBinding, error) {
-	ret, err := c.Client.Get(name, metav1.GetOptions{})
+	ret, err := c.Client.Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +89,7 @@ func (c ClusterRoleBindingClientAdapter) Get(namespace, name string) (RoleBindin
 }
 
 func (c ClusterRoleBindingClientAdapter) Create(in RoleBinding) (RoleBinding, error) {
-	ret, err := c.Client.Create(in.(ClusterRoleBindingAdapter).ClusterRoleBinding)
+	ret, err := c.Client.Create(context.TODO(), in.(ClusterRoleBindingAdapter).ClusterRoleBinding, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +97,7 @@ func (c ClusterRoleBindingClientAdapter) Create(in RoleBinding) (RoleBinding, er
 }
 
 func (c ClusterRoleBindingClientAdapter) Update(in RoleBinding) (RoleBinding, error) {
-	ret, err := c.Client.Update(in.(ClusterRoleBindingAdapter).ClusterRoleBinding)
+	ret, err := c.Client.Update(context.TODO(), in.(ClusterRoleBindingAdapter).ClusterRoleBinding, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -105,5 +106,5 @@ func (c ClusterRoleBindingClientAdapter) Update(in RoleBinding) (RoleBinding, er
 }
 
 func (c ClusterRoleBindingClientAdapter) Delete(namespace, name string, uid types.UID) error {
-	return c.Client.Delete(name, &metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	return c.Client.Delete(context.TODO(), name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
 }

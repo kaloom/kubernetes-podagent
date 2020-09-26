@@ -18,7 +18,6 @@ package util
 
 import (
 	"fmt"
-	"net/url"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -29,19 +28,18 @@ func FromApiserverCache(opts *metav1.GetOptions) {
 	opts.ResourceVersion = "0"
 }
 
-func parseEndpoint(endpoint string) (string, string, error) {
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return "", "", err
+// GetNodenameForKernel gets hostname value to set in the hostname field (the nodename field of struct utsname) of the pod.
+func GetNodenameForKernel(hostname string, hostDomainName string, setHostnameAsFQDN *bool) (string, error) {
+	kernelHostname := hostname
+	// FQDN has to be 64 chars to fit in the Linux nodename kernel field (specification 64 chars and the null terminating char).
+	const fqdnMaxLen = 64
+	if len(hostDomainName) > 0 && setHostnameAsFQDN != nil && *setHostnameAsFQDN == true {
+		fqdn := fmt.Sprintf("%s.%s", hostname, hostDomainName)
+		// FQDN has to be shorter than hostnameMaxLen characters.
+		if len(fqdn) > fqdnMaxLen {
+			return "", fmt.Errorf("Failed to construct FQDN from pod hostname and cluster domain, FQDN %s is too long (%d characters is the max, %d characters requested)", fqdn, fqdnMaxLen, len(fqdn))
+		}
+		kernelHostname = fqdn
 	}
-
-	if u.Scheme == "tcp" {
-		return "tcp", u.Host, nil
-	} else if u.Scheme == "unix" {
-		return "unix", u.Path, nil
-	} else if u.Scheme == "" {
-		return "", "", fmt.Errorf("Using %q as endpoint is deprecated, please consider using full url format", endpoint)
-	} else {
-		return u.Scheme, "", fmt.Errorf("protocol %q not supported", u.Scheme)
-	}
+	return kernelHostname, nil
 }

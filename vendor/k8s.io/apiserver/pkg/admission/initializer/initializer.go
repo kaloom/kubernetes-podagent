@@ -17,47 +17,45 @@ limitations under the License.
 package initializer
 
 import (
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/component-base/featuregate"
 )
 
 type pluginInitializer struct {
 	externalClient    kubernetes.Interface
 	externalInformers informers.SharedInformerFactory
 	authorizer        authorizer.Authorizer
-	// serverIdentifyingClientCert used to provide identity when calling out to admission plugins
-	serverIdentifyingClientCert []byte
-	// serverIdentifyingClientKey private key for the client certificate used when calling out to admission plugins
-	serverIdentifyingClientKey []byte
-	scheme                     *runtime.Scheme
+	featureGates      featuregate.FeatureGate
 }
 
 // New creates an instance of admission plugins initializer.
-// TODO(p0lyn0mial): make the parameters public, this construction seems to be redundant.
+// This constructor is public with a long param list so that callers immediately know that new information can be expected
+// during compilation when they update a level.
 func New(
 	extClientset kubernetes.Interface,
 	extInformers informers.SharedInformerFactory,
 	authz authorizer.Authorizer,
-	serverIdentifyingClientCert,
-	serverIdentifyingClientKey []byte,
-	scheme *runtime.Scheme,
-) (pluginInitializer, error) {
+	featureGates featuregate.FeatureGate,
+) pluginInitializer {
 	return pluginInitializer{
-		externalClient:              extClientset,
-		externalInformers:           extInformers,
-		authorizer:                  authz,
-		serverIdentifyingClientCert: serverIdentifyingClientCert,
-		serverIdentifyingClientKey:  serverIdentifyingClientKey,
-		scheme: scheme,
-	}, nil
+		externalClient:    extClientset,
+		externalInformers: extInformers,
+		authorizer:        authz,
+		featureGates:      featureGates,
+	}
 }
 
 // Initialize checks the initialization interfaces implemented by a plugin
 // and provide the appropriate initialization data
 func (i pluginInitializer) Initialize(plugin admission.Interface) {
+	// First tell the plugin about enabled features, so it can decide whether to start informers or not
+	if wants, ok := plugin.(WantsFeatures); ok {
+		wants.InspectFeatureGates(i.featureGates)
+	}
+
 	if wants, ok := plugin.(WantsExternalKubeClientSet); ok {
 		wants.SetExternalKubeClientSet(i.externalClient)
 	}
@@ -68,14 +66,6 @@ func (i pluginInitializer) Initialize(plugin admission.Interface) {
 
 	if wants, ok := plugin.(WantsAuthorizer); ok {
 		wants.SetAuthorizer(i.authorizer)
-	}
-
-	if wants, ok := plugin.(WantsClientCert); ok {
-		wants.SetClientCert(i.serverIdentifyingClientCert, i.serverIdentifyingClientKey)
-	}
-
-	if wants, ok := plugin.(WantsScheme); ok {
-		wants.SetScheme(i.scheme)
 	}
 }
 

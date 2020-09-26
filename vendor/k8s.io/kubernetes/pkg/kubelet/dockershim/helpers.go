@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -17,48 +19,42 @@ limitations under the License.
 package dockershim
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
-	"github.com/blang/semver"
 	dockertypes "github.com/docker/docker/api/types"
 	dockercontainer "github.com/docker/docker/api/types/container"
 	dockerfilters "github.com/docker/docker/api/types/filters"
 	dockernat "github.com/docker/go-connections/nat"
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
+	v1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/credentialprovider"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
 	"k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/security/apparmor"
 	"k8s.io/kubernetes/pkg/util/parsers"
 )
 
 const (
-	annotationPrefix = "annotation."
-
-	// Docker changed the API for specifying options in v1.11
-	securityOptSeparatorChangeVersion = "1.23.0" // Corresponds to docker 1.11.x
-	securityOptSeparatorOld           = ':'
-	securityOptSeparatorNew           = '='
+	annotationPrefix     = "annotation."
+	securityOptSeparator = '='
 )
 
 var (
-	conflictRE = regexp.MustCompile(`Conflict. (?:.)+ is already in use by container ([0-9a-z]+)`)
+	conflictRE = regexp.MustCompile(`Conflict. (?:.)+ is already in use by container \"?([0-9a-z]+)\"?`)
 
 	// this is hacky, but extremely common.
 	// if a container starts but the executable file is not found, runc gives a message that matches
 	startRE = regexp.MustCompile(`\\\\\\\"(.*)\\\\\\\": executable file not found`)
 
-	// Docker changes the security option separator from ':' to '=' in the 1.23
-	// API version.
-	optsSeparatorChangeVersion = semver.MustParse(securityOptSeparatorChangeVersion)
-
-	defaultSeccompOpt = []dockerOpt{{"seccomp", "unconfined", ""}}
+	defaultSeccompOpt = []dockerOpt{{"seccomp", v1.SeccompProfileNameUnconfined, ""}}
 )
 
 // generateEnvList converts KeyValue list to a list of strings, in the form of
@@ -151,7 +147,7 @@ func generateMountBindings(mounts []*runtimeapi.Mount) []string {
 		case runtimeapi.MountPropagation_PROPAGATION_HOST_TO_CONTAINER:
 			attrs = append(attrs, "rslave")
 		default:
-			glog.Warningf("unknown propagation mode for hostPath %q", m.HostPath)
+			klog.Warningf("unknown propagation mode for hostPath %q", m.HostPath)
 			// Falls back to "private"
 		}
 
@@ -181,8 +177,10 @@ func makePortsAndBindings(pm []*runtimeapi.PortMapping) (dockernat.PortSet, map[
 			protocol = "/udp"
 		case runtimeapi.Protocol_TCP:
 			protocol = "/tcp"
+		case runtimeapi.Protocol_SCTP:
+			protocol = "/sctp"
 		default:
-			glog.Warningf("Unknown protocol %q: defaulting to TCP", port.Protocol)
+			klog.Warningf("Unknown protocol %q: defaulting to TCP", port.Protocol)
 			protocol = "/tcp"
 		}
 
@@ -221,14 +219,6 @@ func getApparmorSecurityOpts(sc *runtimeapi.LinuxContainerSecurityContext, separ
 
 	fmtOpts := fmtDockerOpts(appArmorOpts, separator)
 	return fmtOpts, nil
-}
-
-func getNetworkNamespace(c *dockertypes.ContainerJSON) (string, error) {
-	if c.State.Pid == 0 {
-		// Docker reports pid 0 for an exited container.
-		return "", fmt.Errorf("Cannot find network namespace for the terminated container %q", c.ID)
-	}
-	return fmt.Sprintf(dockerNetNSFmt, c.State.Pid), nil
 }
 
 // dockerFilter wraps around dockerfilters.Args and provides methods to modify
@@ -298,21 +288,21 @@ func recoverFromCreationConflictIfNeeded(client libdocker.Interface, createConfi
 	}
 
 	id := matches[1]
-	glog.Warningf("Unable to create pod sandbox due to conflict. Attempting to remove sandbox %q", id)
-	if rmErr := client.RemoveContainer(id, dockertypes.ContainerRemoveOptions{RemoveVolumes: true}); rmErr == nil {
-		glog.V(2).Infof("Successfully removed conflicting container %q", id)
+	klog.Warningf("Unable to create pod sandbox due to conflict. Attempting to remove sandbox %q", id)
+	rmErr := client.RemoveContainer(id, dockertypes.ContainerRemoveOptions{RemoveVolumes: true})
+	if rmErr == nil {
+		klog.V(2).Infof("Successfully removed conflicting container %q", id)
 		return nil, err
-	} else {
-		glog.Errorf("Failed to remove the conflicting container %q: %v", id, rmErr)
-		// Return if the error is not container not found error.
-		if !libdocker.IsContainerNotFoundError(rmErr) {
-			return nil, err
-		}
+	}
+	klog.Errorf("Failed to remove the conflicting container %q: %v", id, rmErr)
+	// Return if the error is not container not found error.
+	if !libdocker.IsContainerNotFoundError(rmErr) {
+		return nil, err
 	}
 
 	// randomize the name to avoid conflict.
 	createConfig.Name = randomizeName(createConfig.Name)
-	glog.V(2).Infof("Create the container with randomized name %s", createConfig.Name)
+	klog.V(2).Infof("Create the container with randomized name %s", createConfig.Name)
 	return client.CreateContainer(createConfig)
 }
 
@@ -327,21 +317,6 @@ func transformStartContainerError(err error) error {
 		return fmt.Errorf("executable not found in $PATH")
 	}
 	return err
-}
-
-// getSecurityOptSeparator returns the security option separator based on the
-// docker API version.
-// TODO: Remove this function along with the relevant code when we no longer
-// need to support docker 1.10.
-func getSecurityOptSeparator(v *semver.Version) rune {
-	switch v.Compare(optsSeparatorChangeVersion) {
-	case -1:
-		// Current version is less than the API change version; use the old
-		// separator.
-		return securityOptSeparatorOld
-	default:
-		return securityOptSeparatorNew
-	}
 }
 
 // ensureSandboxImageExists pulls the sandbox image when it's not present.
@@ -362,7 +337,7 @@ func ensureSandboxImageExists(client libdocker.Interface, image string) error {
 	keyring := credentialprovider.NewDockerKeyring()
 	creds, withCredentials := keyring.Lookup(repoToPull)
 	if !withCredentials {
-		glog.V(3).Infof("Pulling image %q without credentials", image)
+		klog.V(3).Infof("Pulling image %q without credentials", image)
 
 		err := client.PullImage(image, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
 		if err != nil {
@@ -374,7 +349,7 @@ func ensureSandboxImageExists(client libdocker.Interface, image string) error {
 
 	var pullErrs []error
 	for _, currentCreds := range creds {
-		authConfig := credentialprovider.LazyProvide(currentCreds)
+		authConfig := dockertypes.AuthConfig(currentCreds)
 		err := client.PullImage(image, authConfig, dockertypes.ImagePullOptions{})
 		// If there was no error, return success
 		if err == nil {
@@ -388,18 +363,18 @@ func ensureSandboxImageExists(client libdocker.Interface, image string) error {
 }
 
 func getAppArmorOpts(profile string) ([]dockerOpt, error) {
-	if profile == "" || profile == apparmor.ProfileRuntimeDefault {
+	if profile == "" || profile == v1.AppArmorBetaProfileRuntimeDefault {
 		// The docker applies the default profile by default.
 		return nil, nil
 	}
 
 	// Return unconfined profile explicitly
-	if profile == apparmor.ProfileNameUnconfined {
-		return []dockerOpt{{"apparmor", apparmor.ProfileNameUnconfined, ""}}, nil
+	if profile == v1.AppArmorBetaProfileNameUnconfined {
+		return []dockerOpt{{"apparmor", v1.AppArmorBetaProfileNameUnconfined, ""}}, nil
 	}
 
 	// Assume validation has already happened.
-	profileName := strings.TrimPrefix(profile, apparmor.ProfileNamePrefix)
+	profileName := strings.TrimPrefix(profile, v1.AppArmorBetaProfileNamePrefix)
 	return []dockerOpt{{"apparmor", profileName, ""}}, nil
 }
 
@@ -423,3 +398,44 @@ type dockerOpt struct {
 func (d dockerOpt) GetKV() (string, string) {
 	return d.key, d.value
 }
+
+// sharedWriteLimiter limits the total output written across one or more streams.
+type sharedWriteLimiter struct {
+	delegate io.Writer
+	limit    *int64
+}
+
+func (w sharedWriteLimiter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	limit := atomic.LoadInt64(w.limit)
+	if limit <= 0 {
+		return 0, errMaximumWrite
+	}
+	var truncated bool
+	if limit < int64(len(p)) {
+		p = p[0:limit]
+		truncated = true
+	}
+	n, err := w.delegate.Write(p)
+	if n > 0 {
+		atomic.AddInt64(w.limit, -1*int64(n))
+	}
+	if err == nil && truncated {
+		err = errMaximumWrite
+	}
+	return n, err
+}
+
+func sharedLimitWriter(w io.Writer, limit *int64) io.Writer {
+	if w == nil {
+		return nil
+	}
+	return &sharedWriteLimiter{
+		delegate: w,
+		limit:    limit,
+	}
+}
+
+var errMaximumWrite = errors.New("maximum write")

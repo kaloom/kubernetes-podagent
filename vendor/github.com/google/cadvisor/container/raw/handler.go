@@ -25,54 +25,40 @@ import (
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/machine"
 
-	"github.com/golang/glog"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
-	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
-	"github.com/opencontainers/runc/libcontainer/configs"
+	"k8s.io/klog/v2"
 )
 
 type rawContainerHandler struct {
 	// Name of the container for this handler.
 	name               string
-	cgroupSubsystems   *libcontainer.CgroupSubsystems
 	machineInfoFactory info.MachineInfoFactory
 
 	// Absolute path to the cgroup hierarchies of this container.
 	// (e.g.: "cpu" -> "/sys/fs/cgroup/cpu/test")
 	cgroupPaths map[string]string
 
-	// Manager of this container's cgroups.
-	cgroupManager cgroups.Manager
+	fsInfo          fs.FsInfo
+	externalMounts  []common.Mount
+	includedMetrics container.MetricSet
 
-	fsInfo         fs.FsInfo
-	externalMounts []common.Mount
-
-	rootFs string
-
-	// Metrics to be ignored.
-	ignoreMetrics container.MetricSet
-
-	pid int
+	libcontainerHandler *libcontainer.Handler
 }
 
 func isRootCgroup(name string) bool {
 	return name == "/"
 }
 
-func newRawContainerHandler(name string, cgroupSubsystems *libcontainer.CgroupSubsystems, machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, watcher *common.InotifyWatcher, rootFs string, ignoreMetrics container.MetricSet) (container.ContainerHandler, error) {
-	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems.MountPoints, name)
-
+func newRawContainerHandler(name string, cgroupSubsystems *libcontainer.CgroupSubsystems, machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, watcher *common.InotifyWatcher, rootFs string, includedMetrics container.MetricSet) (container.ContainerHandler, error) {
 	cHints, err := common.GetContainerHintsFromFile(*common.ArgContainerHints)
 	if err != nil {
 		return nil, err
 	}
 
-	// Generate the equivalent cgroup manager for this container.
-	cgroupManager := &cgroupfs.Manager{
-		Cgroups: &configs.Cgroup{
-			Name: name,
-		},
-		Paths: cgroupPaths,
+	cgroupPaths := common.MakeCgroupPaths(cgroupSubsystems.MountPoints, name)
+
+	cgroupManager, err := libcontainer.NewCgroupManager(name, cgroupPaths)
+	if err != nil {
+		return nil, err
 	}
 
 	var externalMounts []common.Mount
@@ -86,33 +72,35 @@ func newRawContainerHandler(name string, cgroupSubsystems *libcontainer.CgroupSu
 	pid := 0
 	if isRootCgroup(name) {
 		pid = 1
+
+		// delete pids from cgroup paths because /sys/fs/cgroup/pids/pids.current not exist
+		delete(cgroupPaths, "pids")
 	}
 
+	handler := libcontainer.NewHandler(cgroupManager, rootFs, pid, includedMetrics)
+
 	return &rawContainerHandler{
-		name:               name,
-		cgroupSubsystems:   cgroupSubsystems,
-		machineInfoFactory: machineInfoFactory,
-		cgroupPaths:        cgroupPaths,
-		cgroupManager:      cgroupManager,
-		fsInfo:             fsInfo,
-		externalMounts:     externalMounts,
-		rootFs:             rootFs,
-		ignoreMetrics:      ignoreMetrics,
-		pid:                pid,
+		name:                name,
+		machineInfoFactory:  machineInfoFactory,
+		cgroupPaths:         cgroupPaths,
+		fsInfo:              fsInfo,
+		externalMounts:      externalMounts,
+		includedMetrics:     includedMetrics,
+		libcontainerHandler: handler,
 	}, nil
 }
 
-func (self *rawContainerHandler) ContainerReference() (info.ContainerReference, error) {
+func (h *rawContainerHandler) ContainerReference() (info.ContainerReference, error) {
 	// We only know the container by its one name.
 	return info.ContainerReference{
-		Name: self.name,
+		Name: h.name,
 	}, nil
 }
 
-func (self *rawContainerHandler) GetRootNetworkDevices() ([]info.NetInfo, error) {
+func (h *rawContainerHandler) GetRootNetworkDevices() ([]info.NetInfo, error) {
 	nd := []info.NetInfo{}
-	if isRootCgroup(self.name) {
-		mi, err := self.machineInfoFactory.GetMachineInfo()
+	if isRootCgroup(h.name) {
+		mi, err := h.machineInfoFactory.GetMachineInfo()
 		if err != nil {
 			return nd, err
 		}
@@ -122,22 +110,22 @@ func (self *rawContainerHandler) GetRootNetworkDevices() ([]info.NetInfo, error)
 }
 
 // Nothing to start up.
-func (self *rawContainerHandler) Start() {}
+func (h *rawContainerHandler) Start() {}
 
 // Nothing to clean up.
-func (self *rawContainerHandler) Cleanup() {}
+func (h *rawContainerHandler) Cleanup() {}
 
-func (self *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
+func (h *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
 	const hasNetwork = false
-	hasFilesystem := isRootCgroup(self.name) || len(self.externalMounts) > 0
-	spec, err := common.GetSpec(self.cgroupPaths, self.machineInfoFactory, hasNetwork, hasFilesystem)
+	hasFilesystem := isRootCgroup(h.name) || len(h.externalMounts) > 0
+	spec, err := common.GetSpec(h.cgroupPaths, h.machineInfoFactory, hasNetwork, hasFilesystem)
 	if err != nil {
 		return spec, err
 	}
 
-	if isRootCgroup(self.name) {
+	if isRootCgroup(h.name) {
 		// Check physical network devices for root container.
-		nd, err := self.GetRootNetworkDevices()
+		nd, err := h.GetRootNetworkDevices()
 		if err != nil {
 			return spec, err
 		}
@@ -146,7 +134,7 @@ func (self *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
 		// Get memory and swap limits of the running machine
 		memLimit, err := machine.GetMachineMemoryCapacity()
 		if err != nil {
-			glog.Warningf("failed to obtain memory limit for machine container")
+			klog.Warningf("failed to obtain memory limit for machine container")
 			spec.HasMemory = false
 		} else {
 			spec.Memory.Limit = uint64(memLimit)
@@ -156,7 +144,7 @@ func (self *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
 
 		swapLimit, err := machine.GetMachineSwapCapacity()
 		if err != nil {
-			glog.Warningf("failed to obtain swap limit for machine container")
+			klog.Warningf("failed to obtain swap limit for machine container")
 		} else {
 			spec.Memory.SwapLimit = uint64(swapLimit)
 		}
@@ -196,48 +184,58 @@ func fsToFsStats(fs *fs.Fs) info.FsStats {
 	}
 }
 
-func (self *rawContainerHandler) getFsStats(stats *info.ContainerStats) error {
-	var allFs []fs.Fs
-	// Get Filesystem information only for the root cgroup.
-	if isRootCgroup(self.name) {
-		filesystems, err := self.fsInfo.GetGlobalFsInfo()
-		if err != nil {
-			return err
-		}
-		for i := range filesystems {
-			fs := filesystems[i]
-			stats.Filesystem = append(stats.Filesystem, fsToFsStats(&fs))
-		}
-		allFs = filesystems
-	} else if len(self.externalMounts) > 0 {
-		var mountSet map[string]struct{}
-		mountSet = make(map[string]struct{})
-		for _, mount := range self.externalMounts {
-			mountSet[mount.HostDir] = struct{}{}
-		}
-		filesystems, err := self.fsInfo.GetFsInfoForPath(mountSet)
-		if err != nil {
-			return err
-		}
-		for i := range filesystems {
-			fs := filesystems[i]
-			stats.Filesystem = append(stats.Filesystem, fsToFsStats(&fs))
-		}
-		allFs = filesystems
+func (h *rawContainerHandler) getFsStats(stats *info.ContainerStats) error {
+	var filesystems []fs.Fs
+	var err error
+	// Early exist if no disk metrics are to be collected.
+	if !h.includedMetrics.Has(container.DiskUsageMetrics) && !h.includedMetrics.Has(container.DiskIOMetrics) {
+		return nil
 	}
 
-	common.AssignDeviceNamesToDiskStats(&fsNamer{fs: allFs, factory: self.machineInfoFactory}, &stats.DiskIo)
+	// Get Filesystem information only for the root cgroup.
+	if isRootCgroup(h.name) {
+		filesystems, err = h.fsInfo.GetGlobalFsInfo()
+		if err != nil {
+			return err
+		}
+	} else {
+		if len(h.externalMounts) > 0 {
+			mountSet := make(map[string]struct{})
+			for _, mount := range h.externalMounts {
+				mountSet[mount.HostDir] = struct{}{}
+			}
+			filesystems, err = h.fsInfo.GetFsInfoForPath(mountSet)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if h.includedMetrics.Has(container.DiskUsageMetrics) {
+		for i := range filesystems {
+			fs := filesystems[i]
+			stats.Filesystem = append(stats.Filesystem, fsToFsStats(&fs))
+		}
+	}
+
+	if h.includedMetrics.Has(container.DiskIOMetrics) {
+		common.AssignDeviceNamesToDiskStats(&fsNamer{fs: filesystems, factory: h.machineInfoFactory}, &stats.DiskIo)
+
+	}
 	return nil
 }
 
-func (self *rawContainerHandler) GetStats() (*info.ContainerStats, error) {
-	stats, err := libcontainer.GetStats(self.cgroupManager, self.rootFs, self.pid, self.ignoreMetrics)
+func (h *rawContainerHandler) GetStats() (*info.ContainerStats, error) {
+	if *disableRootCgroupStats && isRootCgroup(h.name) {
+		return nil, nil
+	}
+	stats, err := h.libcontainerHandler.GetStats()
 	if err != nil {
 		return stats, err
 	}
 
 	// Get filesystem stats.
-	err = self.getFsStats(stats)
+	err = h.getFsStats(stats)
 	if err != nil {
 		return stats, err
 	}
@@ -245,36 +243,36 @@ func (self *rawContainerHandler) GetStats() (*info.ContainerStats, error) {
 	return stats, nil
 }
 
-func (self *rawContainerHandler) GetCgroupPath(resource string) (string, error) {
-	path, ok := self.cgroupPaths[resource]
+func (h *rawContainerHandler) GetCgroupPath(resource string) (string, error) {
+	path, ok := h.cgroupPaths[resource]
 	if !ok {
-		return "", fmt.Errorf("could not find path for resource %q for container %q\n", resource, self.name)
+		return "", fmt.Errorf("could not find path for resource %q for container %q", resource, h.name)
 	}
 	return path, nil
 }
 
-func (self *rawContainerHandler) GetContainerLabels() map[string]string {
+func (h *rawContainerHandler) GetContainerLabels() map[string]string {
 	return map[string]string{}
 }
 
-func (self *rawContainerHandler) GetContainerIPAddress() string {
+func (h *rawContainerHandler) GetContainerIPAddress() string {
 	// the IP address for the raw container corresponds to the system ip address.
 	return "127.0.0.1"
 }
 
-func (self *rawContainerHandler) ListContainers(listType container.ListType) ([]info.ContainerReference, error) {
-	return common.ListContainers(self.name, self.cgroupPaths, listType)
+func (h *rawContainerHandler) ListContainers(listType container.ListType) ([]info.ContainerReference, error) {
+	return common.ListContainers(h.name, h.cgroupPaths, listType)
 }
 
-func (self *rawContainerHandler) ListProcesses(listType container.ListType) ([]int, error) {
-	return libcontainer.GetProcesses(self.cgroupManager)
+func (h *rawContainerHandler) ListProcesses(listType container.ListType) ([]int, error) {
+	return h.libcontainerHandler.GetProcesses()
 }
 
-func (self *rawContainerHandler) Exists() bool {
-	return common.CgroupExists(self.cgroupPaths)
+func (h *rawContainerHandler) Exists() bool {
+	return common.CgroupExists(h.cgroupPaths)
 }
 
-func (self *rawContainerHandler) Type() container.ContainerType {
+func (h *rawContainerHandler) Type() container.ContainerType {
 	return container.ContainerTypeRaw
 }
 

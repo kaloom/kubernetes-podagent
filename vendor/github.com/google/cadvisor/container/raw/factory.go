@@ -17,18 +17,20 @@ package raw
 import (
 	"flag"
 	"fmt"
+	"strings"
 
 	"github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/container/common"
 	"github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
-	watch "github.com/google/cadvisor/manager/watcher"
+	watch "github.com/google/cadvisor/watcher"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 var dockerOnly = flag.Bool("docker_only", false, "Only report docker containers in addition to root stats")
+var disableRootCgroupStats = flag.Bool("disable_root_cgroup_stats", false, "Disable collecting root Cgroup stats")
 
 type rawFactory struct {
 	// Factory for machine information.
@@ -43,34 +45,47 @@ type rawFactory struct {
 	// Watcher for inotify events.
 	watcher *common.InotifyWatcher
 
-	// List of metrics to be ignored.
-	ignoreMetrics map[container.MetricKind]struct{}
+	// List of metrics to be included.
+	includedMetrics map[container.MetricKind]struct{}
+
+	// List of raw container cgroup path prefix whitelist.
+	rawPrefixWhiteList []string
 }
 
-func (self *rawFactory) String() string {
+func (f *rawFactory) String() string {
 	return "raw"
 }
 
-func (self *rawFactory) NewContainerHandler(name string, inHostNamespace bool) (container.ContainerHandler, error) {
+func (f *rawFactory) NewContainerHandler(name string, inHostNamespace bool) (container.ContainerHandler, error) {
 	rootFs := "/"
 	if !inHostNamespace {
 		rootFs = "/rootfs"
 	}
-	return newRawContainerHandler(name, self.cgroupSubsystems, self.machineInfoFactory, self.fsInfo, self.watcher, rootFs, self.ignoreMetrics)
+	return newRawContainerHandler(name, f.cgroupSubsystems, f.machineInfoFactory, f.fsInfo, f.watcher, rootFs, f.includedMetrics)
 }
 
-// The raw factory can handle any container. If --docker_only is set to false, non-docker containers are ignored.
-func (self *rawFactory) CanHandleAndAccept(name string) (bool, bool, error) {
-	accept := name == "/" || !*dockerOnly
-	return true, accept, nil
+// The raw factory can handle any container. If --docker_only is set to true, non-docker containers are ignored except for "/" and those whitelisted by raw_cgroup_prefix_whitelist flag.
+func (f *rawFactory) CanHandleAndAccept(name string) (bool, bool, error) {
+	if name == "/" {
+		return true, true, nil
+	}
+	if *dockerOnly && f.rawPrefixWhiteList[0] == "" {
+		return true, false, nil
+	}
+	for _, prefix := range f.rawPrefixWhiteList {
+		if strings.HasPrefix(name, prefix) {
+			return true, true, nil
+		}
+	}
+	return true, false, nil
 }
 
-func (self *rawFactory) DebugInfo() map[string][]string {
-	return common.DebugInfo(self.watcher.GetWatches())
+func (f *rawFactory) DebugInfo() map[string][]string {
+	return common.DebugInfo(f.watcher.GetWatches())
 }
 
-func Register(machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, ignoreMetrics map[container.MetricKind]struct{}) error {
-	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems()
+func Register(machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics map[container.MetricKind]struct{}, rawPrefixWhiteList []string) error {
+	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems(includedMetrics)
 	if err != nil {
 		return fmt.Errorf("failed to get cgroup subsystems: %v", err)
 	}
@@ -83,13 +98,14 @@ func Register(machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, igno
 		return err
 	}
 
-	glog.Infof("Registering Raw factory")
+	klog.V(1).Infof("Registering Raw factory")
 	factory := &rawFactory{
 		machineInfoFactory: machineInfoFactory,
 		fsInfo:             fsInfo,
 		cgroupSubsystems:   &cgroupSubsystems,
 		watcher:            watcher,
-		ignoreMetrics:      ignoreMetrics,
+		includedMetrics:    includedMetrics,
+		rawPrefixWhiteList: rawPrefixWhiteList,
 	}
 	container.RegisterContainerHandlerFactory(factory, []watch.ContainerWatchSource{watch.Raw})
 	return nil

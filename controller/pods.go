@@ -199,7 +199,7 @@ func (c *Controller) watchPods(ctx context.Context, nodeName string) (cache.Cont
 	}
 	fieldsToMatch := fs.AsSelector()
 	// Define what we want to look for (Pods)
-	watchlist := cache.NewListWatchFromClient(c.kubeClient.Core().RESTClient(), "pods", apiv1.NamespaceAll, fieldsToMatch)
+	watchlist := cache.NewListWatchFromClient(c.kubeClient.CoreV1().RESTClient(), "pods", apiv1.NamespaceAll, fieldsToMatch)
 	// batching and collapsing events is controlled by the resyncPeriod, 0 would disable the resync
 	resyncPeriod := 30 * time.Second
 	// Setup an informer to call functions when the watchlist changes

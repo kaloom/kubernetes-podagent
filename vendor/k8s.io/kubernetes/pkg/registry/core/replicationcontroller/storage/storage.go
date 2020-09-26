@@ -19,6 +19,7 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -26,13 +27,14 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
+	autoscalingv1 "k8s.io/kubernetes/pkg/apis/autoscaling/v1"
 	"k8s.io/kubernetes/pkg/apis/autoscaling/validation"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	extensionsv1beta1 "k8s.io/kubernetes/pkg/apis/extensions/v1beta1"
 	"k8s.io/kubernetes/pkg/printers"
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
@@ -46,15 +48,17 @@ type ControllerStorage struct {
 	Scale      *ScaleREST
 }
 
-func NewStorage(optsGetter generic.RESTOptionsGetter) ControllerStorage {
-	controllerREST, statusREST := NewREST(optsGetter)
-	controllerRegistry := replicationcontroller.NewRegistry(controllerREST)
+func NewStorage(optsGetter generic.RESTOptionsGetter) (ControllerStorage, error) {
+	controllerREST, statusREST, err := NewREST(optsGetter)
+	if err != nil {
+		return ControllerStorage{}, err
+	}
 
 	return ControllerStorage{
 		Controller: controllerREST,
 		Status:     statusREST,
-		Scale:      &ScaleREST{registry: controllerRegistry},
-	}
+		Scale:      &ScaleREST{store: controllerREST.Store},
+	}, nil
 }
 
 type REST struct {
@@ -62,7 +66,7 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work against replication controllers.
-func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST) {
+func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	store := &genericregistry.Store{
 		NewFunc:                  func() runtime.Object { return &api.ReplicationController{} },
 		NewListFunc:              func() runtime.Object { return &api.ReplicationControllerList{} },
@@ -73,17 +77,17 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST) {
 		UpdateStrategy: replicationcontroller.Strategy,
 		DeleteStrategy: replicationcontroller.Strategy,
 
-		TableConvertor: printerstorage.TableConvertor{TablePrinter: printers.NewTablePrinter().With(printersinternal.AddHandlers)},
+		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: replicationcontroller.GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, nil, err
 	}
 
 	statusStore := *store
 	statusStore.UpdateStrategy = replicationcontroller.StatusStrategy
 
-	return &REST{store}, &StatusREST{store: &statusStore}
+	return &REST{store}, &StatusREST{store: &statusStore}, nil
 }
 
 // Implement ShortNamesProvider
@@ -112,25 +116,32 @@ func (r *StatusREST) New() runtime.Object {
 }
 
 // Get retrieves the object from the storage. It is required to support Patch.
-func (r *StatusREST) Get(ctx genericapirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
 }
 
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx genericapirequest.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, name, objInfo)
+func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
+	// subresources should never allow create on update.
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
 }
 
 type ScaleREST struct {
-	registry replicationcontroller.Registry
+	store *genericregistry.Store
 }
 
 // ScaleREST implements Patcher
 var _ = rest.Patcher(&ScaleREST{})
 var _ = rest.GroupVersionKindProvider(&ScaleREST{})
 
-func (r *ScaleREST) GroupVersionKind() schema.GroupVersionKind {
-	return schema.GroupVersionKind{Group: "autoscaling", Version: "v1", Kind: "Scale"}
+func (r *ScaleREST) GroupVersionKind(containingGV schema.GroupVersion) schema.GroupVersionKind {
+	switch containingGV {
+	case extensionsv1beta1.SchemeGroupVersion:
+		return extensionsv1beta1.SchemeGroupVersion.WithKind("Scale")
+	default:
+		return autoscalingv1.SchemeGroupVersion.WithKind("Scale")
+	}
 }
 
 // New creates a new Scale object
@@ -138,45 +149,46 @@ func (r *ScaleREST) New() runtime.Object {
 	return &autoscaling.Scale{}
 }
 
-func (r *ScaleREST) Get(ctx genericapirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
-	rc, err := r.registry.GetController(ctx, name, options)
+func (r *ScaleREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	obj, err := r.store.Get(ctx, name, options)
 	if err != nil {
 		return nil, errors.NewNotFound(autoscaling.Resource("replicationcontrollers/scale"), name)
 	}
+	rc := obj.(*api.ReplicationController)
 	return scaleFromRC(rc), nil
 }
 
-func (r *ScaleREST) Update(ctx genericapirequest.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
-	rc, err := r.registry.GetController(ctx, name, &metav1.GetOptions{})
-	if err != nil {
-		return nil, false, errors.NewNotFound(autoscaling.Resource("replicationcontrollers/scale"), name)
-	}
-
-	oldScale := scaleFromRC(rc)
-	obj, err := objInfo.UpdatedObject(ctx, oldScale)
-	if err != nil {
-		return nil, false, err
-	}
-
-	if obj == nil {
-		return nil, false, errors.NewBadRequest("nil update passed to Scale")
-	}
-	scale, ok := obj.(*autoscaling.Scale)
-	if !ok {
-		return nil, false, errors.NewBadRequest(fmt.Sprintf("wrong object passed to Scale update: %v", obj))
-	}
-
-	if errs := validation.ValidateScale(scale); len(errs) > 0 {
-		return nil, false, errors.NewInvalid(autoscaling.Kind("Scale"), scale.Name, errs)
-	}
-
-	rc.Spec.Replicas = scale.Spec.Replicas
-	rc.ResourceVersion = scale.ResourceVersion
-	rc, err = r.registry.UpdateController(ctx, rc)
+func (r *ScaleREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	obj, _, err := r.store.Update(
+		ctx,
+		name,
+		&scaleUpdatedObjectInfo{name, objInfo},
+		toScaleCreateValidation(createValidation),
+		toScaleUpdateValidation(updateValidation),
+		false,
+		options,
+	)
 	if err != nil {
 		return nil, false, err
 	}
+	rc := obj.(*api.ReplicationController)
 	return scaleFromRC(rc), false, nil
+}
+
+func toScaleCreateValidation(f rest.ValidateObjectFunc) rest.ValidateObjectFunc {
+	return func(ctx context.Context, obj runtime.Object) error {
+		return f(ctx, scaleFromRC(obj.(*api.ReplicationController)))
+	}
+}
+
+func toScaleUpdateValidation(f rest.ValidateObjectUpdateFunc) rest.ValidateObjectUpdateFunc {
+	return func(ctx context.Context, obj, old runtime.Object) error {
+		return f(
+			ctx,
+			scaleFromRC(obj.(*api.ReplicationController)),
+			scaleFromRC(old.(*api.ReplicationController)),
+		)
+	}
 }
 
 // scaleFromRC returns a scale subresource for a replication controller.
@@ -197,4 +209,60 @@ func scaleFromRC(rc *api.ReplicationController) *autoscaling.Scale {
 			Selector: labels.SelectorFromSet(rc.Spec.Selector).String(),
 		},
 	}
+}
+
+// scaleUpdatedObjectInfo transforms existing replication controller -> existing scale -> new scale -> new replication controller
+type scaleUpdatedObjectInfo struct {
+	name       string
+	reqObjInfo rest.UpdatedObjectInfo
+}
+
+func (i *scaleUpdatedObjectInfo) Preconditions() *metav1.Preconditions {
+	return i.reqObjInfo.Preconditions()
+}
+
+func (i *scaleUpdatedObjectInfo) UpdatedObject(ctx context.Context, oldObj runtime.Object) (runtime.Object, error) {
+	replicationcontroller, ok := oldObj.DeepCopyObject().(*api.ReplicationController)
+	if !ok {
+		return nil, errors.NewBadRequest(fmt.Sprintf("expected existing object type to be ReplicationController, got %T", replicationcontroller))
+	}
+	// if zero-value, the existing object does not exist
+	if len(replicationcontroller.ResourceVersion) == 0 {
+		return nil, errors.NewNotFound(api.Resource("replicationcontrollers/scale"), i.name)
+	}
+
+	// replicationcontroller -> old scale
+	oldScale := scaleFromRC(replicationcontroller)
+
+	// old scale -> new scale
+	newScaleObj, err := i.reqObjInfo.UpdatedObject(ctx, oldScale)
+	if err != nil {
+		return nil, err
+	}
+	if newScaleObj == nil {
+		return nil, errors.NewBadRequest("nil update passed to Scale")
+	}
+	scale, ok := newScaleObj.(*autoscaling.Scale)
+	if !ok {
+		return nil, errors.NewBadRequest(fmt.Sprintf("expected input object type to be Scale, but %T", newScaleObj))
+	}
+
+	// validate
+	if errs := validation.ValidateScale(scale); len(errs) > 0 {
+		return nil, errors.NewInvalid(autoscaling.Kind("Scale"), replicationcontroller.Name, errs)
+	}
+
+	// validate precondition if specified (resourceVersion matching is handled by storage)
+	if len(scale.UID) > 0 && scale.UID != replicationcontroller.UID {
+		return nil, errors.NewConflict(
+			api.Resource("replicationcontrollers/scale"),
+			replicationcontroller.Name,
+			fmt.Errorf("Precondition failed: UID in precondition: %v, UID in object meta: %v", scale.UID, replicationcontroller.UID),
+		)
+	}
+
+	// move replicas/resourceVersion fields to object and return
+	replicationcontroller.Spec.Replicas = scale.Spec.Replicas
+	replicationcontroller.ResourceVersion = scale.ResourceVersion
+	return replicationcontroller, nil
 }

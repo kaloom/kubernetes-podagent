@@ -17,49 +17,116 @@ limitations under the License.
 package service
 
 import (
+	"context"
 	"fmt"
+	"net"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
-	"k8s.io/kubernetes/pkg/api"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/api/validation"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
+	"k8s.io/kubernetes/pkg/features"
+	netutil "k8s.io/utils/net"
 )
+
+type Strategy interface {
+	rest.RESTCreateUpdateStrategy
+	rest.RESTExportStrategy
+}
 
 // svcStrategy implements behavior for Services
 type svcStrategy struct {
 	runtime.ObjectTyper
 	names.NameGenerator
+
+	ipFamilies []api.IPFamily
 }
 
-// Services is the default logic that applies when creating and updating Service
-// objects.
-var Strategy = svcStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+// StrategyForServiceCIDRs returns the appropriate service strategy for the given configuration.
+func StrategyForServiceCIDRs(primaryCIDR net.IPNet, hasSecondary bool) (Strategy, api.IPFamily) {
+	// detect this cluster default Service IPFamily (ipfamily of --service-cluster-ip-range)
+	// we do it once here, to avoid having to do it over and over during ipfamily assignment
+	serviceIPFamily := api.IPv4Protocol
+	if netutil.IsIPv6CIDR(&primaryCIDR) {
+		serviceIPFamily = api.IPv6Protocol
+	}
+
+	var strategy Strategy
+	switch {
+	case hasSecondary && serviceIPFamily == api.IPv4Protocol:
+		strategy = svcStrategy{
+			ObjectTyper:   legacyscheme.Scheme,
+			NameGenerator: names.SimpleNameGenerator,
+			ipFamilies:    []api.IPFamily{api.IPv4Protocol, api.IPv6Protocol},
+		}
+	case hasSecondary && serviceIPFamily == api.IPv6Protocol:
+		strategy = svcStrategy{
+			ObjectTyper:   legacyscheme.Scheme,
+			NameGenerator: names.SimpleNameGenerator,
+			ipFamilies:    []api.IPFamily{api.IPv6Protocol, api.IPv4Protocol},
+		}
+	case serviceIPFamily == api.IPv6Protocol:
+		strategy = svcStrategy{
+			ObjectTyper:   legacyscheme.Scheme,
+			NameGenerator: names.SimpleNameGenerator,
+			ipFamilies:    []api.IPFamily{api.IPv6Protocol},
+		}
+	default:
+		strategy = svcStrategy{
+			ObjectTyper:   legacyscheme.Scheme,
+			NameGenerator: names.SimpleNameGenerator,
+			ipFamilies:    []api.IPFamily{api.IPv4Protocol},
+		}
+	}
+	return strategy, serviceIPFamily
+}
 
 // NamespaceScoped is true for services.
 func (svcStrategy) NamespaceScoped() bool {
 	return true
 }
 
-// PrepareForCreate clears fields that are not allowed to be set by end users on creation.
-func (svcStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+// PrepareForCreate sets contextual defaults and clears fields that are not allowed to be set by end users on creation.
+func (strategy svcStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	service := obj.(*api.Service)
 	service.Status = api.ServiceStatus{}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) && service.Spec.IPFamily == nil {
+		family := strategy.ipFamilies[0]
+		service.Spec.IPFamily = &family
+	}
+
+	dropServiceDisabledFields(service, nil)
 }
 
-// PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (svcStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+// PrepareForUpdate sets contextual defaults and clears fields that are not allowed to be set by end users on update.
+func (strategy svcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newService := obj.(*api.Service)
 	oldService := old.(*api.Service)
 	newService.Status = oldService.Status
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) && newService.Spec.IPFamily == nil {
+		if oldService.Spec.IPFamily != nil {
+			newService.Spec.IPFamily = oldService.Spec.IPFamily
+		} else {
+			family := strategy.ipFamilies[0]
+			newService.Spec.IPFamily = &family
+		}
+	}
+
+	dropServiceDisabledFields(newService, oldService)
 }
 
 // Validate validates a new service.
-func (svcStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+func (strategy svcStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	service := obj.(*api.Service)
-	return validation.ValidateService(service)
+	allErrs := validation.ValidateServiceCreate(service)
+	allErrs = append(allErrs, validation.ValidateConditionalService(service, nil, strategy.ipFamilies)...)
+	return allErrs
 }
 
 // Canonicalize normalizes the object after validation.
@@ -70,15 +137,17 @@ func (svcStrategy) AllowCreateOnUpdate() bool {
 	return true
 }
 
-func (svcStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidateServiceUpdate(obj.(*api.Service), old.(*api.Service))
+func (strategy svcStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	allErrs := validation.ValidateServiceUpdate(obj.(*api.Service), old.(*api.Service))
+	allErrs = append(allErrs, validation.ValidateConditionalService(obj.(*api.Service), old.(*api.Service), strategy.ipFamilies)...)
+	return allErrs
 }
 
 func (svcStrategy) AllowUnconditionalUpdate() bool {
 	return true
 }
 
-func (svcStrategy) Export(ctx genericapirequest.Context, obj runtime.Object, exact bool) error {
+func (svcStrategy) Export(ctx context.Context, obj runtime.Object, exact bool) error {
 	t, ok := obj.(*api.Service)
 	if !ok {
 		// unexpected programmer error
@@ -100,15 +169,53 @@ func (svcStrategy) Export(ctx genericapirequest.Context, obj runtime.Object, exa
 	return nil
 }
 
-type serviceStatusStrategy struct {
-	svcStrategy
+// dropServiceDisabledFields drops fields that are not used if their associated feature gates
+// are not enabled.  The typical pattern is:
+//     if !utilfeature.DefaultFeatureGate.Enabled(features.MyFeature) && !myFeatureInUse(oldSvc) {
+//         newSvc.Spec.MyFeature = nil
+//     }
+func dropServiceDisabledFields(newSvc *api.Service, oldSvc *api.Service) {
+	// Drop IPFamily if DualStack is not enabled
+	if !utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) && !serviceIPFamilyInUse(oldSvc) {
+		newSvc.Spec.IPFamily = nil
+	}
+
+	// Drop TopologyKeys if ServiceTopology is not enabled
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ServiceTopology) && !topologyKeysInUse(oldSvc) {
+		newSvc.Spec.TopologyKeys = nil
+	}
 }
 
-// StatusStrategy is the default logic invoked when updating service status.
-var StatusStrategy = serviceStatusStrategy{Strategy}
+// returns true if svc.Spec.ServiceIPFamily field is in use
+func serviceIPFamilyInUse(svc *api.Service) bool {
+	if svc == nil {
+		return false
+	}
+	if svc.Spec.IPFamily != nil {
+		return true
+	}
+	return false
+}
+
+// returns true if svc.Spec.TopologyKeys field is in use
+func topologyKeysInUse(svc *api.Service) bool {
+	if svc == nil {
+		return false
+	}
+	return len(svc.Spec.TopologyKeys) > 0
+}
+
+type serviceStatusStrategy struct {
+	Strategy
+}
+
+// NewServiceStatusStrategy creates a status strategy for the provided base strategy.
+func NewServiceStatusStrategy(strategy Strategy) Strategy {
+	return serviceStatusStrategy{strategy}
+}
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update of status
-func (serviceStatusStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+func (serviceStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newService := obj.(*api.Service)
 	oldService := old.(*api.Service)
 	// status changes are not allowed to update spec
@@ -116,6 +223,6 @@ func (serviceStatusStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj
 }
 
 // ValidateUpdate is the default update validation for an end user updating status
-func (serviceStatusStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
+func (serviceStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateServiceStatusUpdate(obj.(*api.Service), old.(*api.Service))
 }
