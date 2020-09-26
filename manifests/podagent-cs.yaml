@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: podagent
+  namespace: kube-system
+  labels:
+    k8s-app: podagent
+spec:
+  selector:
+    matchLabels:
+      name: podagent
+  template:
+    metadata:
+      labels:
+        name: podagent
+    spec:
+      serviceAccountName: podagent
+      hostNetwork: true # needed by the cni-plugin when it get invoked in the same namespace of the podagent
+      hostPID: true     # needed also by the cni-plugin when it get invoked in the same namespace of the podagent
+      nodeSelector:
+        beta.kubernetes.io/arch: amd64
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: podagent
+        image: kaloom/podagent:0.1.1
+        resources:
+          limits:
+            cpu: 100m
+            memory: 50Mi
+          requests:
+            cpu: 100m
+            memory: 50Mi
+        securityContext:
+          privileged: true
+        env:
+        - name: PODAGENT_HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: "PODAGENT_EXTRA_ARGS"
+          value: "-logtostderr -container-type crio -cni-vendor-name kaloom"
+        - name: _CNI_LOGGING_LEVEL # export the logging level to the cni-plugin
+          value: "3"
+        volumeMounts:
+        - name: hostcninet
+          mountPath: /host/etc/cni/net.d
+          readOnly: true
+        - name: cnibin
+          mountPath: /opt/cni/bin
+          readOnly: true
+        - name: vendorcnibin
+          mountPath: /opt/kaloom/cni/bin
+          readOnly: true
+        - name: cri
+          mountPath: /var/run/crio.sock
+          readOnly: true
+        - name: libcni
+          mountPath: /var/lib/cni
+      volumes:
+      - name: hostcninet
+        hostPath:
+          path: /etc/cni/net.d
+          type: Directory
+      - name: cnibin
+        hostPath:
+          path: /opt/cni/bin
+          type: DirectoryOrCreate
+      - name: vendorcnibin
+        hostPath:
+          path: /opt/kaloom/cni/bin
+          type: DirectoryOrCreate
+      - name: cri
+        hostPath:
+          path: /var/run/netns/crio.sock
+          type: Socket
+      - name: libcni
+        hostPath:
+          path: /var/lib/cni
+          type: Directory
+      - name: netns
+        hostPath:
+          path: /var/run/netns
+          type: Directory
