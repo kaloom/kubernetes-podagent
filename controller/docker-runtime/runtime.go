@@ -58,7 +58,10 @@ func (dr *DockerRuntime) GetNetNS(podSandboxID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return getNetworkNamespace(c)
+
+	ns, err := getNetworkNamespace(c)
+	glog.V(5).Infof("GetNetNS:%s %v", ns, err)
+	return ns, err
 }
 
 // GetSandboxID returns kubernete's docker "pause" container ID
@@ -73,6 +76,7 @@ func (dr *DockerRuntime) GetSandboxID(containerID string) (string, error) {
 			return val, nil
 		}
 	}
+	glog.V(5).Infof("GetSandboxID:SandboxId %s", kubernetesSandboxID)
 	return "", fmt.Errorf("Cannot find label %s in container %q", kubernetesSandboxID, c.ID)
 }
 

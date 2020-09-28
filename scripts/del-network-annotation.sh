@@ -11,6 +11,6 @@ if [ -z "$pod" ] || [ -z "$net" ]; then
     exit 1
 fi
 
-remaining_nets=$(kubectl get pod $pod -o jsonpath='{.metadata.annotations.networks}' | jq ".[] | select(.name != \"$net\")" | sed -e 's/}/},/g' | sed -e '$s/.$//')
+remaining_nets=$(kubectl get pod $pod -n $ns -o jsonpath='{.metadata.annotations.networks}' | jq ".[] | select(.name != \"$net\")" | sed -e 's/}/},/g' | sed -e '$s/.$//')
 
 kubectl annotate -n ${ns} --overwrite pods ${pod} networks="[ $remaining_nets ]"

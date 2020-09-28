@@ -97,9 +97,10 @@ see [kactus cni-plugin repo](https://github.com/kaloom/kubernetes-kactus-cni-plu
 
 > $ `kubectl apply -f manifests/podagent-serviceaccount-and-rbac.yaml`
 
-3. delopy the podagent as a daemon set:
+3. deploy the podagent as a daemon set:
 
-> $ `kubectl apply -f manifests/podagent-ds.yaml`
+> $ `kubectl apply -f manifests/podagent-ds.yaml`       for docker
+> $ `kubectl apply -f manifests/podagent-cs.yaml`       for crio
 
 
 ### Note
