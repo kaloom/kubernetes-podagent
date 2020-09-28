@@ -1,3 +1,5 @@
+// +build !dockerless
+
 /*
 Copyright 2015 The Kubernetes Authors.
 
@@ -22,7 +24,7 @@ import (
 	"time"
 
 	dockertypes "github.com/docker/docker/api/types"
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
 	"k8s.io/client-go/tools/remotecommand"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -58,6 +60,7 @@ func (d *dockerExitError) ExitStatus() int {
 // NativeExecHandler executes commands in Docker containers using Docker's exec API.
 type NativeExecHandler struct{}
 
+// ExecInContainer executes the cmd in container using the Docker's exec API
 func (*NativeExecHandler) ExecInContainer(client libdocker.Interface, container *dockertypes.ContainerJSON, cmd []string, stdin io.Reader, stdout, stderr io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize, timeout time.Duration) error {
 	done := make(chan struct{})
 	defer close(done)
@@ -124,7 +127,7 @@ func (*NativeExecHandler) ExecInContainer(client libdocker.Interface, container 
 
 		count++
 		if count == 5 {
-			glog.Errorf("Exec session %s in container %s terminated but process still running!", execObj.ID, container.ID)
+			klog.Errorf("Exec session %s in container %s terminated but process still running!", execObj.ID, container.ID)
 			break
 		}
 

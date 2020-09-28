@@ -55,7 +55,7 @@ type PodStatus struct {
 	// A human readable message indicating details about why the pod is in this state.
 	// +optional
 	Message string
-	// A brief CamelCase message indicating details about why the pod is in this state. e.g. 'OutOfDisk'
+	// A brief CamelCase message indicating details about why the pod is in this state. e.g. 'DiskPressure'
 	// +optional
 	Reason string
 
@@ -135,4 +135,36 @@ type PodList struct {
 	metav1.ListMeta
 
 	Items []Pod
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// ReplicaSet ensures that a specified number of pod replicas are running at any given time.
+type ReplicaSet struct {
+	metav1.TypeMeta
+	// +optional
+	metav1.ObjectMeta
+
+	// Spec defines the desired behavior of this ReplicaSet.
+	// +optional
+	Spec ReplicaSetSpec
+
+	// Status is the current status of this ReplicaSet. This data may be
+	// out of date by some window of time.
+	// +optional
+	Status ReplicaSetStatus
+}
+
+// ReplicaSetSpec is the specification of a ReplicaSet.
+// As the internal representation of a ReplicaSet, it must have
+// a Template set.
+type ReplicaSetSpec struct {
+	// Replicas is the number of desired replicas.
+	Replicas int32
+}
+
+// ReplicaSetStatus represents the current status of a ReplicaSet.
+type ReplicaSetStatus struct {
+	// Replicas is the number of actual replicas.
+	Replicas int32
 }

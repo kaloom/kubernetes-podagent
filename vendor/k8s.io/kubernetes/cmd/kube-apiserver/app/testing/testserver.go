@@ -17,96 +17,202 @@ limitations under the License.
 package testing
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
-	"strings"
-	"testing"
+	"path"
+	"path/filepath"
+	"runtime"
 	"time"
 
+	"github.com/spf13/pflag"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/util/cert"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	testutil "k8s.io/kubernetes/test/utils"
 )
 
 // TearDownFunc is to be called to tear down a test server.
 type TearDownFunc func()
 
-// StartTestServer starts a etcd server and kube-apiserver. A rest client config and a tear-down func
-// are returned.
+// TestServerInstanceOptions Instance options the TestServer
+type TestServerInstanceOptions struct {
+	// DisableStorageCleanup Disable the automatic storage cleanup
+	DisableStorageCleanup bool
+
+	// Enable cert-auth for the kube-apiserver
+	EnableCertAuth bool
+}
+
+// TestServer return values supplied by kube-test-ApiServer
+type TestServer struct {
+	ClientConfig *restclient.Config        // Rest client config
+	ServerOpts   *options.ServerRunOptions // ServerOpts
+	TearDownFn   TearDownFunc              // TearDown function
+	TmpDir       string                    // Temp Dir used, by the apiserver
+}
+
+// Logger allows t.Testing and b.Testing to be passed to StartTestServer and StartTestServerOrDie
+type Logger interface {
+	Errorf(format string, args ...interface{})
+	Fatalf(format string, args ...interface{})
+	Logf(format string, args ...interface{})
+}
+
+// NewDefaultTestServerOptions Default options for TestServer instances
+func NewDefaultTestServerOptions() *TestServerInstanceOptions {
+	return &TestServerInstanceOptions{
+		DisableStorageCleanup: false,
+		EnableCertAuth:        true,
+	}
+}
+
+// StartTestServer starts a etcd server and kube-apiserver. A rest client config and a tear-down func,
+// and location of the tmpdir are returned.
 //
-// Note: we return a tear-down func instead of a stop channel because the later will leak temporariy
-// 		 files that becaues Golang testing's call to os.Exit will not give a stop channel go routine
-// 		 enough time to remove temporariy files.
-func StartTestServer(t *testing.T) (result *restclient.Config, tearDownForCaller TearDownFunc, err error) {
-	var tmpDir string
-	var etcdServer *etcdtesting.EtcdTestServer
+// Note: we return a tear-down func instead of a stop channel because the later will leak temporary
+// 		 files that because Golang testing's call to os.Exit will not give a stop channel go routine
+// 		 enough time to remove temporary files.
+func StartTestServer(t Logger, instanceOptions *TestServerInstanceOptions, customFlags []string, storageConfig *storagebackend.Config) (result TestServer, err error) {
+	if instanceOptions == nil {
+		instanceOptions = NewDefaultTestServerOptions()
+	}
+
+	// TODO : Remove TrackStorageCleanup below when PR
+	// https://github.com/kubernetes/kubernetes/pull/50690
+	// merges as that shuts down storage properly
+	if !instanceOptions.DisableStorageCleanup {
+		registry.TrackStorageCleanup()
+	}
+
 	stopCh := make(chan struct{})
 	tearDown := func() {
-		close(stopCh)
-		if etcdServer != nil {
-			etcdServer.Terminate(t)
+		if !instanceOptions.DisableStorageCleanup {
+			registry.CleanupStorage()
 		}
-		if len(tmpDir) != 0 {
-			os.RemoveAll(tmpDir)
+		close(stopCh)
+		if len(result.TmpDir) != 0 {
+			os.RemoveAll(result.TmpDir)
 		}
 	}
 	defer func() {
-		if tearDownForCaller == nil {
+		if result.TearDownFn == nil {
 			tearDown()
 		}
 	}()
 
-	t.Logf("Starting etcd...")
-	etcdServer, storageConfig := etcdtesting.NewUnsecuredEtcd3TestClientServer(t, legacyscheme.Scheme)
-
-	tmpDir, err = ioutil.TempDir("", "kubernetes-kube-apiserver")
+	result.TmpDir, err = ioutil.TempDir("", "kubernetes-kube-apiserver")
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to create temp dir: %v", err)
+		return result, fmt.Errorf("failed to create temp dir: %v", err)
 	}
+
+	fs := pflag.NewFlagSet("test", pflag.PanicOnError)
 
 	s := options.NewServerRunOptions()
+	for _, f := range s.Flags().FlagSets {
+		fs.AddFlagSet(f)
+	}
 	s.InsecureServing.BindPort = 0
-	s.SecureServing.BindPort = freePort()
-	s.SecureServing.ServerCert.CertDirectory = tmpDir
-	s.ServiceClusterIPRange.IP = net.IPv4(10, 0, 0, 0)
-	s.ServiceClusterIPRange.Mask = net.CIDRMask(16, 32)
+
+	s.SecureServing.Listener, s.SecureServing.BindPort, err = createLocalhostListenerOnFreePort()
+	if err != nil {
+		return result, fmt.Errorf("failed to create listener: %v", err)
+	}
+	s.SecureServing.ServerCert.CertDirectory = result.TmpDir
+
+	if instanceOptions.EnableCertAuth {
+		// create certificates for aggregation and client-cert auth
+		proxySigningKey, err := testutil.NewPrivateKey()
+		if err != nil {
+			return result, err
+		}
+		proxySigningCert, err := cert.NewSelfSignedCACert(cert.Config{CommonName: "front-proxy-ca"}, proxySigningKey)
+		if err != nil {
+			return result, err
+		}
+		proxyCACertFile := path.Join(s.SecureServing.ServerCert.CertDirectory, "proxy-ca.crt")
+		if err := ioutil.WriteFile(proxyCACertFile, testutil.EncodeCertPEM(proxySigningCert), 0644); err != nil {
+			return result, err
+		}
+		s.Authentication.RequestHeader.ClientCAFile = proxyCACertFile
+		clientSigningKey, err := testutil.NewPrivateKey()
+		if err != nil {
+			return result, err
+		}
+		clientSigningCert, err := cert.NewSelfSignedCACert(cert.Config{CommonName: "client-ca"}, clientSigningKey)
+		if err != nil {
+			return result, err
+		}
+		clientCACertFile := path.Join(s.SecureServing.ServerCert.CertDirectory, "client-ca.crt")
+		if err := ioutil.WriteFile(clientCACertFile, testutil.EncodeCertPEM(clientSigningCert), 0644); err != nil {
+			return result, err
+		}
+		s.Authentication.ClientCert.ClientCA = clientCACertFile
+	}
+
+	s.SecureServing.ExternalAddress = s.SecureServing.Listener.Addr().(*net.TCPAddr).IP // use listener addr although it is a loopback device
+
+	pkgPath, err := pkgPath(t)
+	if err != nil {
+		return result, err
+	}
+	s.SecureServing.ServerCert.FixtureDirectory = filepath.Join(pkgPath, "testdata")
+
+	s.ServiceClusterIPRanges = "10.0.0.0/16"
 	s.Etcd.StorageConfig = *storageConfig
-	s.Etcd.DefaultStorageMediaType = "application/json"
-	s.Admission.PluginNames = strings.Split("Initializers,NamespaceLifecycle,LimitRanger,ServiceAccount,PersistentVolumeLabel,DefaultStorageClass,ResourceQuota,DefaultTolerationSeconds", ",")
 	s.APIEnablement.RuntimeConfig.Set("api/all=true")
 
-	t.Logf("Starting kube-apiserver...")
-	runErrCh := make(chan error, 1)
-	server, err := app.CreateServerChain(s, stopCh)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to create server chain: %v", err)
+	if err := fs.Parse(customFlags); err != nil {
+		return result, err
 	}
+	completedOptions, err := app.Complete(s)
+	if err != nil {
+		return result, fmt.Errorf("failed to set default ServerRunOptions: %v", err)
+	}
+
+	t.Logf("runtime-config=%v", completedOptions.APIEnablement.RuntimeConfig)
+	t.Logf("Starting kube-apiserver on port %d...", s.SecureServing.BindPort)
+	server, err := app.CreateServerChain(completedOptions, stopCh)
+	if err != nil {
+		return result, fmt.Errorf("failed to create server chain: %v", err)
+	}
+
+	errCh := make(chan error)
 	go func(stopCh <-chan struct{}) {
-		if err := server.PrepareRun().Run(stopCh); err != nil {
-			t.Logf("kube-apiserver exited uncleanly: %v", err)
-			runErrCh <- err
+		prepared, err := server.PrepareRun()
+		if err != nil {
+			errCh <- err
+		} else if err := prepared.Run(stopCh); err != nil {
+			errCh <- err
 		}
 	}(stopCh)
 
 	t.Logf("Waiting for /healthz to be ok...")
-	client, err := kubernetes.NewForConfig(server.LoopbackClientConfig)
+
+	client, err := kubernetes.NewForConfig(server.GenericAPIServer.LoopbackClientConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to create a client: %v", err)
+		return result, fmt.Errorf("failed to create a client: %v", err)
 	}
-	err = wait.Poll(100*time.Millisecond, 30*time.Second, func() (bool, error) {
+
+	// wait until healthz endpoint returns ok
+	err = wait.Poll(100*time.Millisecond, time.Minute, func() (bool, error) {
 		select {
-		case err := <-runErrCh:
+		case err := <-errCh:
 			return false, err
 		default:
 		}
 
-		result := client.CoreV1().RESTClient().Get().AbsPath("/healthz").Do()
+		result := client.CoreV1().RESTClient().Get().AbsPath("/healthz").Do(context.TODO())
 		status := 0
 		result.StatusCode(&status)
 		if status == 200 {
@@ -115,50 +221,95 @@ func StartTestServer(t *testing.T) (result *restclient.Config, tearDownForCaller
 		return false, nil
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to wait for /healthz to return ok: %v", err)
+		return result, fmt.Errorf("failed to wait for /healthz to return ok: %v", err)
+	}
+
+	// wait until default namespace is created
+	err = wait.Poll(100*time.Millisecond, 30*time.Second, func() (bool, error) {
+		select {
+		case err := <-errCh:
+			return false, err
+		default:
+		}
+
+		if _, err := client.CoreV1().Namespaces().Get(context.TODO(), "default", metav1.GetOptions{}); err != nil {
+			if !errors.IsNotFound(err) {
+				t.Logf("Unable to get default namespace: %v", err)
+			}
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to wait for default namespace to be created: %v", err)
 	}
 
 	// from here the caller must call tearDown
-	return server.LoopbackClientConfig, tearDown, nil
+	result.ClientConfig = restclient.CopyConfig(server.GenericAPIServer.LoopbackClientConfig)
+	result.ClientConfig.QPS = 1000
+	result.ClientConfig.Burst = 10000
+	result.ServerOpts = s
+	result.TearDownFn = tearDown
+
+	return result, nil
 }
 
-// StartTestServerOrDie calls StartTestServer with up to 5 retries on bind error and dies with
-// t.Fatal if it does not succeed.
-func StartTestServerOrDie(t *testing.T) (*restclient.Config, TearDownFunc) {
-	// retry test because the bind might fail due to a race with another process
-	// binding to the port. We cannot listen to :0 (then the kernel would give us
-	// a port which is free for sure), so we need this workaround.
-
-	var err error
-
-	for retry := 0; retry < 5 && !t.Failed(); retry++ {
-		var config *restclient.Config
-		var td TearDownFunc
-
-		config, td, err = StartTestServer(t)
-		if err == nil {
-			return config, td
-		}
-		if err != nil && !strings.Contains(err.Error(), "bind") {
-			break
-		}
-		t.Logf("Bind error, retrying...")
+// StartTestServerOrDie calls StartTestServer t.Fatal if it does not succeed.
+func StartTestServerOrDie(t Logger, instanceOptions *TestServerInstanceOptions, flags []string, storageConfig *storagebackend.Config) *TestServer {
+	result, err := StartTestServer(t, instanceOptions, flags, storageConfig)
+	if err == nil {
+		return &result
 	}
 
-	t.Fatalf("Failed to launch server: %v", err)
-	return nil, nil
+	t.Fatalf("failed to launch server: %v", err)
+	return nil
 }
 
-func freePort() int {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+func createLocalhostListenerOnFreePort() (net.Listener, int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		panic(err)
+		return nil, 0, err
 	}
 
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		panic(err)
+	// get port
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		ln.Close()
+		return nil, 0, fmt.Errorf("invalid listen address: %q", ln.Addr().String())
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+
+	return ln, tcpAddr.Port, nil
+}
+
+// pkgPath returns the absolute file path to this package's directory. With go
+// test, we can just look at the runtime call stack. However, bazel compiles go
+// binaries with the -trimpath option so the simple approach fails however we
+// can consult environment variables to derive the path.
+//
+// The approach taken here works for both go test and bazel on the assumption
+// that if and only if trimpath is passed, we are running under bazel.
+func pkgPath(t Logger) (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("failed to get current file")
+	}
+
+	pkgPath := filepath.Dir(thisFile)
+
+	// If we find bazel env variables, then -trimpath was passed so we need to
+	// construct the path from the environment.
+	if testSrcdir, testWorkspace := os.Getenv("TEST_SRCDIR"), os.Getenv("TEST_WORKSPACE"); testSrcdir != "" && testWorkspace != "" {
+		t.Logf("Detected bazel env varaiables: TEST_SRCDIR=%q TEST_WORKSPACE=%q", testSrcdir, testWorkspace)
+		pkgPath = filepath.Join(testSrcdir, testWorkspace, pkgPath)
+	}
+
+	// If the path is still not absolute, something other than bazel compiled
+	// with -trimpath.
+	if !filepath.IsAbs(pkgPath) {
+		return "", fmt.Errorf("can't construct an absolute path from %q", pkgPath)
+	}
+
+	t.Logf("Resolved testserver package path to: %q", pkgPath)
+
+	return pkgPath, nil
 }

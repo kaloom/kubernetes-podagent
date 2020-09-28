@@ -21,21 +21,22 @@ limitations under the License.
 package cleaner
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
-	capi "k8s.io/api/certificates/v1beta1"
+	capi "k8s.io/api/certificates/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	certificatesinformers "k8s.io/client-go/informers/certificates/v1beta1"
-	csrclient "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
-	certificateslisters "k8s.io/client-go/listers/certificates/v1beta1"
+	certificatesinformers "k8s.io/client-go/informers/certificates/v1"
+	csrclient "k8s.io/client-go/kubernetes/typed/certificates/v1"
+	certificateslisters "k8s.io/client-go/listers/certificates/v1"
 )
 
 const (
@@ -46,6 +47,7 @@ const (
 	// cleaned up.
 	approvedExpiration = 1 * time.Hour
 	deniedExpiration   = 1 * time.Hour
+	failedExpiration   = 1 * time.Hour
 	pendingExpiration  = 24 * time.Hour
 )
 
@@ -78,8 +80,8 @@ func NewCSRCleanerController(
 func (ccc *CSRCleanerController) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 
-	glog.Infof("Starting CSR cleaner controller")
-	defer glog.Infof("Shutting down CSR cleaner controller")
+	klog.Infof("Starting CSR cleaner controller")
+	defer klog.Infof("Shutting down CSR cleaner controller")
 
 	for i := 0; i < workers; i++ {
 		go wait.Until(ccc.worker, pollingInterval, stopCh)
@@ -92,12 +94,12 @@ func (ccc *CSRCleanerController) Run(workers int, stopCh <-chan struct{}) {
 func (ccc *CSRCleanerController) worker() {
 	csrs, err := ccc.csrLister.List(labels.Everything())
 	if err != nil {
-		glog.Errorf("Unable to list CSRs: %v", err)
+		klog.Errorf("Unable to list CSRs: %v", err)
 		return
 	}
 	for _, csr := range csrs {
 		if err := ccc.handle(csr); err != nil {
-			glog.Errorf("Error while attempting to clean CSR %q: %v", csr.Name, err)
+			klog.Errorf("Error while attempting to clean CSR %q: %v", csr.Name, err)
 		}
 	}
 }
@@ -107,8 +109,8 @@ func (ccc *CSRCleanerController) handle(csr *capi.CertificateSigningRequest) err
 	if err != nil {
 		return err
 	}
-	if isIssuedPastDeadline(csr) || isDeniedPastDeadline(csr) || isPendingPastDeadline(csr) || isIssuedExpired {
-		if err := ccc.csrClient.Delete(csr.Name, nil); err != nil {
+	if isIssuedPastDeadline(csr) || isDeniedPastDeadline(csr) || isFailedPastDeadline(csr) || isPendingPastDeadline(csr) || isIssuedExpired {
+		if err := ccc.csrClient.Delete(context.TODO(), csr.Name, metav1.DeleteOptions{}); err != nil {
 			return fmt.Errorf("unable to delete CSR %q: %v", csr.Name, err)
 		}
 	}
@@ -118,13 +120,13 @@ func (ccc *CSRCleanerController) handle(csr *capi.CertificateSigningRequest) err
 // isIssuedExpired checks if the CSR has been issued a certificate and if the
 // expiration of the certificate (the NotAfter value) has passed.
 func isIssuedExpired(csr *capi.CertificateSigningRequest) (bool, error) {
+	isExpired, err := isExpired(csr)
+	if err != nil {
+		return false, err
+	}
 	for _, c := range csr.Status.Conditions {
-		isExpired, err := isExpired(csr)
-		if err != nil {
-			return false, err
-		}
 		if c.Type == capi.CertificateApproved && isIssued(csr) && isExpired {
-			glog.Infof("Cleaning CSR %q as the associated certificate is expired.", csr.Name, approvedExpiration)
+			klog.Infof("Cleaning CSR %q as the associated certificate is expired.", csr.Name)
 			return true, nil
 		}
 	}
@@ -138,7 +140,7 @@ func isPendingPastDeadline(csr *capi.CertificateSigningRequest) bool {
 	// If there are no Conditions on the status, the CSR will appear via
 	// `kubectl` as `Pending`.
 	if len(csr.Status.Conditions) == 0 && isOlderThan(csr.CreationTimestamp, pendingExpiration) {
-		glog.Infof("Cleaning CSR %q as it is more than %v old and unhandled.", csr.Name, pendingExpiration)
+		klog.Infof("Cleaning CSR %q as it is more than %v old and unhandled.", csr.Name, pendingExpiration)
 		return true
 	}
 	return false
@@ -150,7 +152,20 @@ func isPendingPastDeadline(csr *capi.CertificateSigningRequest) bool {
 func isDeniedPastDeadline(csr *capi.CertificateSigningRequest) bool {
 	for _, c := range csr.Status.Conditions {
 		if c.Type == capi.CertificateDenied && isOlderThan(c.LastUpdateTime, deniedExpiration) {
-			glog.Infof("Cleaning CSR %q as it is more than %v old and denied.", csr.Name, deniedExpiration)
+			klog.Infof("Cleaning CSR %q as it is more than %v old and denied.", csr.Name, deniedExpiration)
+			return true
+		}
+	}
+	return false
+}
+
+// isFailedPastDeadline checks if the certificate has a Failed status and the
+// creation time of the CSR is passed the deadline that pending requests are
+// maintained for.
+func isFailedPastDeadline(csr *capi.CertificateSigningRequest) bool {
+	for _, c := range csr.Status.Conditions {
+		if c.Type == capi.CertificateFailed && isOlderThan(c.LastUpdateTime, deniedExpiration) {
+			klog.Infof("Cleaning CSR %q as it is more than %v old and failed.", csr.Name, deniedExpiration)
 			return true
 		}
 	}
@@ -163,7 +178,7 @@ func isDeniedPastDeadline(csr *capi.CertificateSigningRequest) bool {
 func isIssuedPastDeadline(csr *capi.CertificateSigningRequest) bool {
 	for _, c := range csr.Status.Conditions {
 		if c.Type == capi.CertificateApproved && isIssued(csr) && isOlderThan(c.LastUpdateTime, approvedExpiration) {
-			glog.Infof("Cleaning CSR %q as it is more than %v old and approved.", csr.Name, approvedExpiration)
+			klog.Infof("Cleaning CSR %q as it is more than %v old and approved.", csr.Name, approvedExpiration)
 			return true
 		}
 	}
@@ -179,13 +194,13 @@ func isOlderThan(t metav1.Time, d time.Duration) bool {
 // 'Issued' status. Implicitly, if there is a certificate associated with the
 // CSR, the CSR statuses that are visible via `kubectl` will include 'Issued'.
 func isIssued(csr *capi.CertificateSigningRequest) bool {
-	return csr.Status.Certificate != nil
+	return len(csr.Status.Certificate) > 0
 }
 
 // isExpired checks if the CSR has a certificate and the date in the `NotAfter`
 // field has gone by.
 func isExpired(csr *capi.CertificateSigningRequest) (bool, error) {
-	if csr.Status.Certificate == nil {
+	if len(csr.Status.Certificate) == 0 {
 		return false, nil
 	}
 	block, _ := pem.Decode(csr.Status.Certificate)
@@ -195,6 +210,9 @@ func isExpired(csr *capi.CertificateSigningRequest) (bool, error) {
 	certs, err := x509.ParseCertificates(block.Bytes)
 	if err != nil {
 		return false, fmt.Errorf("unable to parse certificate data: %v", err)
+	}
+	if len(certs) == 0 {
+		return false, fmt.Errorf("no certificates found")
 	}
 	return time.Now().After(certs[0].NotAfter), nil
 }

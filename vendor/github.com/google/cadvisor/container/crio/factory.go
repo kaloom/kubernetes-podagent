@@ -24,9 +24,9 @@ import (
 	"github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
-	"github.com/google/cadvisor/manager/watcher"
+	"github.com/google/cadvisor/watcher"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 // The namespace under which crio aliases are unique.
@@ -55,16 +55,16 @@ type crioFactory struct {
 	// Information about mounted filesystems.
 	fsInfo fs.FsInfo
 
-	ignoreMetrics container.MetricSet
+	includedMetrics container.MetricSet
 
-	client crioClient
+	client CrioClient
 }
 
-func (self *crioFactory) String() string {
+func (f *crioFactory) String() string {
 	return CrioNamespace
 }
 
-func (self *crioFactory) NewContainerHandler(name string, inHostNamespace bool) (handler container.ContainerHandler, err error) {
+func (f *crioFactory) NewContainerHandler(name string, inHostNamespace bool) (handler container.ContainerHandler, err error) {
 	client, err := Client()
 	if err != nil {
 		return
@@ -74,14 +74,14 @@ func (self *crioFactory) NewContainerHandler(name string, inHostNamespace bool) 
 	handler, err = newCrioContainerHandler(
 		client,
 		name,
-		self.machineInfoFactory,
-		self.fsInfo,
-		self.storageDriver,
-		self.storageDir,
-		&self.cgroupSubsystems,
+		f.machineInfoFactory,
+		f.fsInfo,
+		f.storageDriver,
+		f.storageDir,
+		&f.cgroupSubsystems,
 		inHostNamespace,
 		metadataEnvs,
-		self.ignoreMetrics,
+		f.includedMetrics,
 	)
 	return
 }
@@ -108,7 +108,7 @@ func isContainerName(name string) bool {
 }
 
 // crio handles all containers under /crio
-func (self *crioFactory) CanHandleAndAccept(name string) (bool, bool, error) {
+func (f *crioFactory) CanHandleAndAccept(name string) (bool, bool, error) {
 	if strings.HasPrefix(path.Base(name), "crio-conmon") {
 		// TODO(runcom): should we include crio-conmon cgroups?
 		return false, false, nil
@@ -123,20 +123,12 @@ func (self *crioFactory) CanHandleAndAccept(name string) (bool, bool, error) {
 	return true, true, nil
 }
 
-func (self *crioFactory) DebugInfo() map[string][]string {
+func (f *crioFactory) DebugInfo() map[string][]string {
 	return map[string][]string{}
 }
 
-var (
-	// TODO(runcom): handle versioning in CRI-O
-	version_regexp_string    = `(\d+)\.(\d+)\.(\d+)`
-	version_re               = regexp.MustCompile(version_regexp_string)
-	apiversion_regexp_string = `(\d+)\.(\d+)`
-	apiversion_re            = regexp.MustCompile(apiversion_regexp_string)
-)
-
 // Register root container before running this function!
-func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, ignoreMetrics container.MetricSet) error {
+func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics container.MetricSet) error {
 	client, err := Client()
 	if err != nil {
 		return err
@@ -149,12 +141,12 @@ func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, ignoreMetrics c
 
 	// TODO determine crio version so we can work differently w/ future versions if needed
 
-	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems()
+	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems(includedMetrics)
 	if err != nil {
 		return fmt.Errorf("failed to get cgroup subsystems: %v", err)
 	}
 
-	glog.Infof("Registering CRI-O factory")
+	klog.V(1).Infof("Registering CRI-O factory")
 	f := &crioFactory{
 		client:             client,
 		cgroupSubsystems:   cgroupSubsystems,
@@ -162,7 +154,7 @@ func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, ignoreMetrics c
 		machineInfoFactory: factory,
 		storageDriver:      storageDriver(info.StorageDriver),
 		storageDir:         info.StorageRoot,
-		ignoreMetrics:      ignoreMetrics,
+		includedMetrics:    includedMetrics,
 	}
 
 	container.RegisterContainerHandlerFactory(f, []watcher.ContainerWatchSource{watcher.Raw})

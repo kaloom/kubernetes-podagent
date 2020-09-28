@@ -32,9 +32,9 @@ type ContainerType int
 const (
 	ContainerTypeRaw ContainerType = iota
 	ContainerTypeDocker
-	ContainerTypeRkt
-	ContainerTypeSystemd
 	ContainerTypeCrio
+	ContainerTypeContainerd
+	ContainerTypeMesos
 )
 
 // Interface for container operation handlers.

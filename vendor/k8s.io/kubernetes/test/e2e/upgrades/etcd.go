@@ -17,6 +17,7 @@ limitations under the License.
 package upgrades
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -25,25 +26,28 @@ import (
 	"sync"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/kubernetes/pkg/util/version"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2estatefulset "k8s.io/kubernetes/test/e2e/framework/statefulset"
+	e2etestfiles "k8s.io/kubernetes/test/e2e/framework/testfiles"
 )
 
 const manifestPath = "test/e2e/testing-manifests/statefulset/etcd"
 
+// EtcdUpgradeTest tests that etcd is writable before and after a cluster upgrade.
 type EtcdUpgradeTest struct {
 	ip               string
 	successfulWrites int
-	ssTester         *framework.StatefulSetTester
 }
 
+// Name returns the tracking name of the test.
 func (EtcdUpgradeTest) Name() string { return "etcd-upgrade" }
 
+// Skip returns true when this test can be skipped.
 func (EtcdUpgradeTest) Skip(upgCtx UpgradeContext) bool {
 	minVersion := version.MustParseSemantic("1.6.0")
 	for _, vCtx := range upgCtx.Versions {
@@ -55,26 +59,30 @@ func (EtcdUpgradeTest) Skip(upgCtx UpgradeContext) bool {
 }
 
 func kubectlCreate(ns, file string) {
-	path := filepath.Join(framework.TestContext.RepoRoot, manifestPath, file)
-	framework.RunKubectlOrDie("create", "-f", path, fmt.Sprintf("--namespace=%s", ns))
+	data, err := e2etestfiles.Read(filepath.Join(manifestPath, file))
+	if err != nil {
+		framework.Fail(err.Error())
+	}
+	input := string(data)
+	framework.RunKubectlOrDieInput(ns, input, "create", "-f", "-")
 }
 
+// Setup creates etcd statefulset and then verifies that the etcd is writable.
 func (t *EtcdUpgradeTest) Setup(f *framework.Framework) {
 	ns := f.Namespace.Name
 	statefulsetPoll := 30 * time.Second
 	statefulsetTimeout := 10 * time.Minute
-	t.ssTester = framework.NewStatefulSetTester(f.ClientSet)
 
-	By("Creating a PDB")
+	ginkgo.By("Creating a PDB")
 	kubectlCreate(ns, "pdb.yaml")
 
-	By("Creating an etcd StatefulSet")
-	t.ssTester.CreateStatefulSet(manifestPath, ns)
+	ginkgo.By("Creating an etcd StatefulSet")
+	e2estatefulset.CreateStatefulSet(f.ClientSet, manifestPath, ns)
 
-	By("Creating an etcd--test-server deployment")
+	ginkgo.By("Creating an etcd--test-server deployment")
 	kubectlCreate(ns, "tester.yaml")
 
-	By("Getting the ingress IPs from the services")
+	ginkgo.By("Getting the ingress IPs from the services")
 	err := wait.PollImmediate(statefulsetPoll, statefulsetTimeout, func() (bool, error) {
 		if t.ip = t.getServiceIP(f, ns, "test-server"); t.ip == "" {
 			return false, nil
@@ -85,18 +93,20 @@ func (t *EtcdUpgradeTest) Setup(f *framework.Framework) {
 		}
 		return true, nil
 	})
-	Expect(err).NotTo(HaveOccurred())
+	framework.ExpectNoError(err)
 	framework.Logf("Service endpoint is up")
 
-	By("Adding 2 dummy users")
-	Expect(t.addUser("Alice")).NotTo(HaveOccurred())
-	Expect(t.addUser("Bob")).NotTo(HaveOccurred())
+	ginkgo.By("Adding 2 dummy users")
+	err = t.addUser("Alice")
+	framework.ExpectNoError(err)
+	err = t.addUser("Bob")
+	framework.ExpectNoError(err)
 	t.successfulWrites = 2
 
-	By("Verifying that the users exist")
+	ginkgo.By("Verifying that the users exist")
 	users, err := t.listUsers()
-	Expect(err).NotTo(HaveOccurred())
-	Expect(len(users)).To(Equal(2))
+	framework.ExpectNoError(err)
+	framework.ExpectEqual(len(users), 2)
 }
 
 func (t *EtcdUpgradeTest) listUsers() ([]string, error) {
@@ -137,8 +147,8 @@ func (t *EtcdUpgradeTest) addUser(name string) error {
 }
 
 func (t *EtcdUpgradeTest) getServiceIP(f *framework.Framework, ns, svcName string) string {
-	svc, err := f.ClientSet.CoreV1().Services(ns).Get(svcName, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	svc, err := f.ClientSet.CoreV1().Services(ns).Get(context.TODO(), svcName, metav1.GetOptions{})
+	framework.ExpectNoError(err)
 	ingress := svc.Status.LoadBalancer.Ingress
 	if len(ingress) == 0 {
 		return ""
@@ -146,8 +156,9 @@ func (t *EtcdUpgradeTest) getServiceIP(f *framework.Framework, ns, svcName strin
 	return ingress[0].IP
 }
 
+// Test waits for upgrade to complete and verifies if etcd is writable.
 func (t *EtcdUpgradeTest) Test(f *framework.Framework, done <-chan struct{}, upgrade UpgradeType) {
-	By("Continuously polling the database during upgrade.")
+	ginkgo.By("Continuously polling the database during upgrade.")
 	var (
 		success, failures, writeAttempts, lastUserCount int
 		mu                                              sync.Mutex
@@ -181,19 +192,19 @@ func (t *EtcdUpgradeTest) Test(f *framework.Framework, done <-chan struct{}, upg
 	}, 10*time.Millisecond, done)
 	framework.Logf("got %d users; want >=%d", lastUserCount, t.successfulWrites)
 
-	Expect(lastUserCount >= t.successfulWrites).To(BeTrue())
+	framework.ExpectEqual(lastUserCount >= t.successfulWrites, true)
 	ratio := float64(success) / float64(success+failures)
 	framework.Logf("Successful gets %d/%d=%v", success, success+failures, ratio)
 	ratio = float64(t.successfulWrites) / float64(writeAttempts)
 	framework.Logf("Successful writes %d/%d=%v", t.successfulWrites, writeAttempts, ratio)
 	framework.Logf("Errors: %v", errors)
 	// TODO(maisem): tweak this value once we have a few test runs.
-	Expect(ratio > 0.75).To(BeTrue())
+	framework.ExpectEqual(ratio > 0.75, true)
 }
 
 // Teardown does one final check of the data's availability.
 func (t *EtcdUpgradeTest) Teardown(f *framework.Framework) {
 	users, err := t.listUsers()
-	Expect(err).NotTo(HaveOccurred())
-	Expect(len(users) >= t.successfulWrites).To(BeTrue())
+	framework.ExpectNoError(err)
+	framework.ExpectEqual(len(users) >= t.successfulWrites, true)
 }

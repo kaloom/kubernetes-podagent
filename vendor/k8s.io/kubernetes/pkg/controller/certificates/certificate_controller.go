@@ -22,23 +22,27 @@ import (
 	"fmt"
 	"time"
 
-	certificates "k8s.io/api/certificates/v1beta1"
+	"golang.org/x/time/rate"
+
+	certificates "k8s.io/api/certificates/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	certificatesinformers "k8s.io/client-go/informers/certificates/v1beta1"
+	certificatesinformers "k8s.io/client-go/informers/certificates/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	certificateslisters "k8s.io/client-go/listers/certificates/v1beta1"
+	certificateslisters "k8s.io/client-go/listers/certificates/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
-
-	"github.com/golang/glog"
 )
 
 type CertificateController struct {
+	// name is an identifier for this particular controller instance.
+	name string
+
 	kubeClient clientset.Interface
 
 	csrLister  certificateslisters.CertificateSigningRequestLister
@@ -50,31 +54,37 @@ type CertificateController struct {
 }
 
 func NewCertificateController(
+	name string,
 	kubeClient clientset.Interface,
 	csrInformer certificatesinformers.CertificateSigningRequestInformer,
 	handler func(*certificates.CertificateSigningRequest) error,
-) (*CertificateController, error) {
+) *CertificateController {
 	// Send events to the apiserver
 	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(glog.Infof)
-	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.Core().RESTClient()).Events("")})
+	eventBroadcaster.StartStructuredLogging(0)
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 
 	cc := &CertificateController{
+		name:       name,
 		kubeClient: kubeClient,
-		queue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "certificate"),
-		handler:    handler,
+		queue: workqueue.NewNamedRateLimitingQueue(workqueue.NewMaxOfRateLimiter(
+			workqueue.NewItemExponentialFailureRateLimiter(200*time.Millisecond, 1000*time.Second),
+			// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
+			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+		), "certificate"),
+		handler: handler,
 	}
 
 	// Manage the addition/update of certificate requests
 	csrInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			csr := obj.(*certificates.CertificateSigningRequest)
-			glog.V(4).Infof("Adding certificate request %s", csr.Name)
+			klog.V(4).Infof("Adding certificate request %s", csr.Name)
 			cc.enqueueCertificateRequest(obj)
 		},
 		UpdateFunc: func(old, new interface{}) {
 			oldCSR := old.(*certificates.CertificateSigningRequest)
-			glog.V(4).Infof("Updating certificate request %s", oldCSR.Name)
+			klog.V(4).Infof("Updating certificate request %s", oldCSR.Name)
 			cc.enqueueCertificateRequest(new)
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -82,23 +92,22 @@ func NewCertificateController(
 			if !ok {
 				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 				if !ok {
-					glog.V(2).Infof("Couldn't get object from tombstone %#v", obj)
+					klog.V(2).Infof("Couldn't get object from tombstone %#v", obj)
 					return
 				}
 				csr, ok = tombstone.Obj.(*certificates.CertificateSigningRequest)
 				if !ok {
-					glog.V(2).Infof("Tombstone contained object that is not a CSR: %#v", obj)
+					klog.V(2).Infof("Tombstone contained object that is not a CSR: %#v", obj)
 					return
 				}
 			}
-			glog.V(4).Infof("Deleting certificate request %s", csr.Name)
+			klog.V(4).Infof("Deleting certificate request %s", csr.Name)
 			cc.enqueueCertificateRequest(obj)
 		},
 	})
 	cc.csrLister = csrInformer.Lister()
 	cc.csrsSynced = csrInformer.Informer().HasSynced
-	cc.handler = handler
-	return cc, nil
+	return cc
 }
 
 // Run the main goroutine responsible for watching and syncing jobs.
@@ -106,10 +115,10 @@ func (cc *CertificateController) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer cc.queue.ShutDown()
 
-	glog.Infof("Starting certificate controller")
-	defer glog.Infof("Shutting down certificate controller")
+	klog.Infof("Starting certificate controller %q", cc.name)
+	defer klog.Infof("Shutting down certificate controller %q", cc.name)
 
-	if !controller.WaitForCacheSync("certificate", stopCh, cc.csrsSynced) {
+	if !cache.WaitForNamedCacheSync(fmt.Sprintf("certificate-%s", cc.name), stopCh, cc.csrsSynced) {
 		return
 	}
 
@@ -136,7 +145,11 @@ func (cc *CertificateController) processNextWorkItem() bool {
 
 	if err := cc.syncFunc(cKey.(string)); err != nil {
 		cc.queue.AddRateLimited(cKey)
-		utilruntime.HandleError(fmt.Errorf("Sync %v failed with : %v", cKey, err))
+		if _, ignorable := err.(ignorableError); !ignorable {
+			utilruntime.HandleError(fmt.Errorf("Sync %v failed with : %v", cKey, err))
+		} else {
+			klog.V(4).Infof("Sync %v failed with : %v", cKey, err)
+		}
 		return true
 	}
 
@@ -154,31 +167,40 @@ func (cc *CertificateController) enqueueCertificateRequest(obj interface{}) {
 	cc.queue.Add(key)
 }
 
-// maybeSignCertificate will inspect the certificate request and, if it has
-// been approved and meets policy expectations, generate an X509 cert using the
-// cluster CA assets. If successful it will update the CSR approve subresource
-// with the signed certificate.
 func (cc *CertificateController) syncFunc(key string) error {
 	startTime := time.Now()
 	defer func() {
-		glog.V(4).Infof("Finished syncing certificate request %q (%v)", key, time.Now().Sub(startTime))
+		klog.V(4).Infof("Finished syncing certificate request %q (%v)", key, time.Since(startTime))
 	}()
 	csr, err := cc.csrLister.Get(key)
 	if errors.IsNotFound(err) {
-		glog.V(3).Infof("csr has been deleted: %v", key)
+		klog.V(3).Infof("csr has been deleted: %v", key)
 		return nil
 	}
 	if err != nil {
 		return err
 	}
 
-	if csr.Status.Certificate != nil {
+	if len(csr.Status.Certificate) > 0 {
 		// no need to do anything because it already has a cert
 		return nil
 	}
 
 	// need to operate on a copy so we don't mutate the csr in the shared cache
 	csr = csr.DeepCopy()
-
 	return cc.handler(csr)
+}
+
+// IgnorableError returns an error that we shouldn't handle (i.e. log) because
+// it's spammy and usually user error. Instead we will log these errors at a
+// higher log level. We still need to throw these errors to signal that the
+// sync should be retried.
+func IgnorableError(s string, args ...interface{}) ignorableError {
+	return ignorableError(fmt.Sprintf(s, args...))
+}
+
+type ignorableError string
+
+func (e ignorableError) Error() string {
+	return string(e)
 }

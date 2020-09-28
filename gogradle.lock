@@ -11,13 +11,13 @@ dependencies:
       vcs: "git"
     vendorPath: "vendor/bitbucket.org/bertimus9/systemstat"
     transitive: false
-  - name: "bitbucket.org/ww/goautoneg"
+  - name: "github.com/munnerz/goautoneg"
     host:
       name: "k8s.io/kubernetes"
       commit: "d515f0e3d2a2b3afc53fc839d6df6f34ed76c3bf"
       url: "https://github.com/kubernetes/kubernetes"
       vcs: "git"
-    vendorPath: "vendor/bitbucket.org/ww/goautoneg"
+    vendorPath: "vendor/github.com/munnerz/goautoneg"
     transitive: false
   - name: "cloud.google.com/go"
     host:

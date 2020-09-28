@@ -18,29 +18,22 @@ package features
 
 import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/featuregate"
 )
 
 const (
-	// Every feature gate should add method here following this template:
-	//
-	// // owner: @username
-	// // alpha: v1.4
-	// MyFeature() bool
-
-	// owner: @sttts, @nikhita
-	// alpha: v1.8
-	//
-	// CustomResourceValidation is a list of validation methods for CustomResources
-	CustomResourceValidation utilfeature.Feature = "CustomResourceValidation"
+// Every feature gate should add method here following this template:
+//
+// // owner: @username
+// // alpha: v1.4
+// MyFeature() bool
 )
 
 func init() {
-	utilfeature.DefaultFeatureGate.Add(defaultKubernetesFeatureGates)
+	utilfeature.DefaultMutableFeatureGate.Add(defaultKubernetesFeatureGates)
 }
 
 // defaultKubernetesFeatureGates consists of all known Kubernetes-specific feature keys.
 // To add a new feature, define a key for it above and add it here. The features will be
 // available throughout Kubernetes binaries.
-var defaultKubernetesFeatureGates = map[utilfeature.Feature]utilfeature.FeatureSpec{
-	CustomResourceValidation: {Default: false, PreRelease: utilfeature.Alpha},
-}
+var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{}

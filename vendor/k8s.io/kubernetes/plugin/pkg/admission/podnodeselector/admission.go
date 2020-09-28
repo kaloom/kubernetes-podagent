@@ -17,32 +17,37 @@ limitations under the License.
 package podnodeselector
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"reflect"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
-	corelisters "k8s.io/kubernetes/pkg/client/listers/core/internalversion"
-	kubeapiserveradmission "k8s.io/kubernetes/pkg/kubeapiserver/admission"
-	"k8s.io/kubernetes/pkg/kubeapiserver/admission/util"
+	genericadmissioninitializer "k8s.io/apiserver/pkg/admission/initializer"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
-// The annotation key scheduler.alpha.kubernetes.io/node-selector is for assigning
-// node selectors labels to namespaces
+// NamespaceNodeSelectors is for assigning node selectors labels to
+// namespaces. Default value is the annotation key
+// scheduler.alpha.kubernetes.io/node-selector
 var NamespaceNodeSelectors = []string{"scheduler.alpha.kubernetes.io/node-selector"}
+
+// PluginName is a string with the name of the plugin
+const PluginName = "PodNodeSelector"
 
 // Register registers a plugin
 func Register(plugins *admission.Plugins) {
-	plugins.Register("PodNodeSelector", func(config io.Reader) (admission.Interface, error) {
+	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
 		// TODO move this to a versioned configuration file format.
 		pluginConfig := readConfig(config)
 		plugin := NewPodNodeSelector(pluginConfig.PodNodeSelectorPluginConfig)
@@ -50,17 +55,17 @@ func Register(plugins *admission.Plugins) {
 	})
 }
 
-// podNodeSelector is an implementation of admission.Interface.
-type podNodeSelector struct {
+// Plugin is an implementation of admission.Interface.
+type Plugin struct {
 	*admission.Handler
-	client          internalclientset.Interface
-	namespaceLister corelisters.NamespaceLister
+	client          kubernetes.Interface
+	namespaceLister corev1listers.NamespaceLister
 	// global default node selector and namespace whitelists in a cluster.
 	clusterNodeSelectors map[string]string
 }
 
-var _ = kubeapiserveradmission.WantsInternalKubeClientSet(&podNodeSelector{})
-var _ = kubeapiserveradmission.WantsInternalKubeInformerFactory(&podNodeSelector{})
+var _ = genericadmissioninitializer.WantsExternalKubeClientSet(&Plugin{})
+var _ = genericadmissioninitializer.WantsExternalKubeInformerFactory(&Plugin{})
 
 type pluginConfig struct {
 	PodNodeSelectorPluginConfig map[string]string
@@ -92,98 +97,122 @@ func readConfig(config io.Reader) *pluginConfig {
 }
 
 // Admit enforces that pod and its namespace node label selectors matches at least a node in the cluster.
-func (p *podNodeSelector) Admit(a admission.Attributes) error {
-	resource := a.GetResource().GroupResource()
-	if resource != api.Resource("pods") {
+func (p *Plugin) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+	if shouldIgnore(a) {
 		return nil
 	}
-	if a.GetSubresource() != "" {
-		// only run the checks below on pods proper and not subresources
-		return nil
-	}
-
-	obj := a.GetObject()
-	pod, ok := obj.(*api.Pod)
-	if !ok {
-		glog.Errorf("expected pod but got %s", a.GetKind().Kind)
-		return nil
-	}
-
 	if !p.WaitForReady() {
 		return admission.NewForbidden(a, fmt.Errorf("not yet ready to handle request"))
 	}
 
-	updateInitialized, err := util.IsUpdatingInitializedObject(a)
-	if err != nil {
-		return err
-	}
-	if updateInitialized {
-		// node selector of an initialized pod is immutable
-		return nil
-	}
-
-	name := pod.Name
-	nsName := a.GetNamespace()
-	var namespace *api.Namespace
-
-	namespace, err = p.namespaceLister.Get(nsName)
-	if errors.IsNotFound(err) {
-		namespace, err = p.defaultGetNamespace(nsName)
-		if err != nil {
-			if errors.IsNotFound(err) {
-				return err
-			}
-			return errors.NewInternalError(err)
-		}
-	} else if err != nil {
-		return errors.NewInternalError(err)
-	}
-
-	namespaceNodeSelector, err := p.getNodeSelectorMap(namespace)
+	resource := a.GetResource().GroupResource()
+	pod := a.GetObject().(*api.Pod)
+	namespaceNodeSelector, err := p.getNamespaceNodeSelectorMap(a.GetNamespace())
 	if err != nil {
 		return err
 	}
 
 	if labels.Conflicts(namespaceNodeSelector, labels.Set(pod.Spec.NodeSelector)) {
-		return errors.NewForbidden(resource, name, fmt.Errorf("pod node label selector conflicts with its namespace node label selector"))
-	}
-
-	whitelist, err := labels.ConvertSelectorToLabelsMap(p.clusterNodeSelectors[namespace.Name])
-	if err != nil {
-		return err
+		return errors.NewForbidden(resource, pod.Name, fmt.Errorf("pod node label selector conflicts with its namespace node label selector"))
 	}
 
 	// Merge pod node selector = namespace node selector + current pod node selector
+	// second selector wins
 	podNodeSelectorLabels := labels.Merge(namespaceNodeSelector, pod.Spec.NodeSelector)
+	pod.Spec.NodeSelector = map[string]string(podNodeSelectorLabels)
+	return p.Validate(ctx, a, o)
+}
 
-	// whitelist verification
-	if !labels.AreLabelsInWhiteList(podNodeSelectorLabels, whitelist) {
-		return errors.NewForbidden(resource, name, fmt.Errorf("pod node label selector labels conflict with its namespace whitelist"))
+// Validate ensures that the pod node selector is allowed
+func (p *Plugin) Validate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+	if shouldIgnore(a) {
+		return nil
+	}
+	if !p.WaitForReady() {
+		return admission.NewForbidden(a, fmt.Errorf("not yet ready to handle request"))
 	}
 
-	// Updated pod node selector = namespace node selector + current pod node selector
-	pod.Spec.NodeSelector = map[string]string(podNodeSelectorLabels)
+	resource := a.GetResource().GroupResource()
+	pod := a.GetObject().(*api.Pod)
+
+	namespaceNodeSelector, err := p.getNamespaceNodeSelectorMap(a.GetNamespace())
+	if err != nil {
+		return err
+	}
+	if labels.Conflicts(namespaceNodeSelector, labels.Set(pod.Spec.NodeSelector)) {
+		return errors.NewForbidden(resource, pod.Name, fmt.Errorf("pod node label selector conflicts with its namespace node label selector"))
+	}
+
+	// whitelist verification
+	whitelist, err := labels.ConvertSelectorToLabelsMap(p.clusterNodeSelectors[a.GetNamespace()])
+	if err != nil {
+		return err
+	}
+	if !labels.AreLabelsInWhiteList(pod.Spec.NodeSelector, whitelist) {
+		return errors.NewForbidden(resource, pod.Name, fmt.Errorf("pod node label selector labels conflict with its namespace whitelist"))
+	}
+
 	return nil
 }
 
-func NewPodNodeSelector(clusterNodeSelectors map[string]string) *podNodeSelector {
-	return &podNodeSelector{
-		Handler:              admission.NewHandler(admission.Create, admission.Update),
+func (p *Plugin) getNamespaceNodeSelectorMap(namespaceName string) (labels.Set, error) {
+	namespace, err := p.namespaceLister.Get(namespaceName)
+	if errors.IsNotFound(err) {
+		namespace, err = p.defaultGetNamespace(namespaceName)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return nil, err
+			}
+			return nil, errors.NewInternalError(err)
+		}
+	} else if err != nil {
+		return nil, errors.NewInternalError(err)
+	}
+
+	return p.getNodeSelectorMap(namespace)
+}
+
+func shouldIgnore(a admission.Attributes) bool {
+	resource := a.GetResource().GroupResource()
+	if resource != api.Resource("pods") {
+		return true
+	}
+	if a.GetSubresource() != "" {
+		// only run the checks below on pods proper and not subresources
+		return true
+	}
+
+	_, ok := a.GetObject().(*api.Pod)
+	if !ok {
+		klog.Errorf("expected pod but got %s", a.GetKind().Kind)
+		return true
+	}
+
+	return false
+}
+
+// NewPodNodeSelector initializes a podNodeSelector
+func NewPodNodeSelector(clusterNodeSelectors map[string]string) *Plugin {
+	return &Plugin{
+		Handler:              admission.NewHandler(admission.Create),
 		clusterNodeSelectors: clusterNodeSelectors,
 	}
 }
 
-func (a *podNodeSelector) SetInternalKubeClientSet(client internalclientset.Interface) {
-	a.client = client
+// SetExternalKubeClientSet sets the plugin's client
+func (p *Plugin) SetExternalKubeClientSet(client kubernetes.Interface) {
+	p.client = client
 }
 
-func (p *podNodeSelector) SetInternalKubeInformerFactory(f informers.SharedInformerFactory) {
-	namespaceInformer := f.Core().InternalVersion().Namespaces()
+// SetExternalKubeInformerFactory configures the plugin's informer factory
+func (p *Plugin) SetExternalKubeInformerFactory(f informers.SharedInformerFactory) {
+	namespaceInformer := f.Core().V1().Namespaces()
 	p.namespaceLister = namespaceInformer.Lister()
 	p.SetReadyFunc(namespaceInformer.Informer().HasSynced)
 }
 
-func (p *podNodeSelector) Validate() error {
+// ValidateInitialization verifies the object has been properly initialized
+func (p *Plugin) ValidateInitialization() error {
 	if p.namespaceLister == nil {
 		return fmt.Errorf("missing namespaceLister")
 	}
@@ -193,23 +222,22 @@ func (p *podNodeSelector) Validate() error {
 	return nil
 }
 
-func (p *podNodeSelector) defaultGetNamespace(name string) (*api.Namespace, error) {
-	namespace, err := p.client.Core().Namespaces().Get(name, metav1.GetOptions{})
+func (p *Plugin) defaultGetNamespace(name string) (*corev1.Namespace, error) {
+	namespace, err := p.client.CoreV1().Namespaces().Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("namespace %s does not exist", name)
 	}
 	return namespace, nil
 }
 
-func (p *podNodeSelector) getNodeSelectorMap(namespace *api.Namespace) (labels.Set, error) {
+func (p *Plugin) getNodeSelectorMap(namespace *corev1.Namespace) (labels.Set, error) {
 	selector := labels.Set{}
-	labelsMap := labels.Set{}
 	var err error
 	found := false
 	if len(namespace.ObjectMeta.Annotations) > 0 {
 		for _, annotation := range NamespaceNodeSelectors {
 			if ns, ok := namespace.ObjectMeta.Annotations[annotation]; ok {
-				labelsMap, err = labels.ConvertSelectorToLabelsMap(ns)
+				labelsMap, err := labels.ConvertSelectorToLabelsMap(ns)
 				if err != nil {
 					return labels.Set{}, err
 				}

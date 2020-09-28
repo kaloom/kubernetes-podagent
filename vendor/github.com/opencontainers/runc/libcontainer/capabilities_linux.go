@@ -4,7 +4,6 @@ package libcontainer
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
@@ -72,7 +71,11 @@ func newContainerCapList(capConfig *configs.Capabilities) (*containerCapabilitie
 		}
 		ambient = append(ambient, v)
 	}
-	pid, err := capability.NewPid(os.Getpid())
+	pid, err := capability.NewPid2(0)
+	if err != nil {
+		return nil, err
+	}
+	err = pid.Load()
 	if err != nil {
 		return nil, err
 	}

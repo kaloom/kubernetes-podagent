@@ -17,17 +17,18 @@ limitations under the License.
 package reconciliation
 
 import (
+	"context"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/apis/rbac"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/rbac/internalversion"
+	rbacv1client "k8s.io/client-go/kubernetes/typed/rbac/v1"
 )
 
 // +k8s:deepcopy-gen=true
 // +k8s:deepcopy-gen:interfaces=k8s.io/kubernetes/pkg/registry/rbac/reconciliation.RuleOwner
 // +k8s:deepcopy-gen:nonpointer-interfaces=true
 type ClusterRoleRuleOwner struct {
-	ClusterRole *rbac.ClusterRole
+	ClusterRole *rbacv1.ClusterRole
 }
 
 func (o ClusterRoleRuleOwner) GetObject() runtime.Object {
@@ -58,20 +59,28 @@ func (o ClusterRoleRuleOwner) SetAnnotations(in map[string]string) {
 	o.ClusterRole.Annotations = in
 }
 
-func (o ClusterRoleRuleOwner) GetRules() []rbac.PolicyRule {
+func (o ClusterRoleRuleOwner) GetRules() []rbacv1.PolicyRule {
 	return o.ClusterRole.Rules
 }
 
-func (o ClusterRoleRuleOwner) SetRules(in []rbac.PolicyRule) {
+func (o ClusterRoleRuleOwner) SetRules(in []rbacv1.PolicyRule) {
 	o.ClusterRole.Rules = in
 }
 
+func (o ClusterRoleRuleOwner) GetAggregationRule() *rbacv1.AggregationRule {
+	return o.ClusterRole.AggregationRule
+}
+
+func (o ClusterRoleRuleOwner) SetAggregationRule(in *rbacv1.AggregationRule) {
+	o.ClusterRole.AggregationRule = in
+}
+
 type ClusterRoleModifier struct {
-	Client internalversion.ClusterRoleInterface
+	Client rbacv1client.ClusterRoleInterface
 }
 
 func (c ClusterRoleModifier) Get(namespace, name string) (RuleOwner, error) {
-	ret, err := c.Client.Get(name, metav1.GetOptions{})
+	ret, err := c.Client.Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +88,7 @@ func (c ClusterRoleModifier) Get(namespace, name string) (RuleOwner, error) {
 }
 
 func (c ClusterRoleModifier) Create(in RuleOwner) (RuleOwner, error) {
-	ret, err := c.Client.Create(in.(ClusterRoleRuleOwner).ClusterRole)
+	ret, err := c.Client.Create(context.TODO(), in.(ClusterRoleRuleOwner).ClusterRole, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +96,7 @@ func (c ClusterRoleModifier) Create(in RuleOwner) (RuleOwner, error) {
 }
 
 func (c ClusterRoleModifier) Update(in RuleOwner) (RuleOwner, error) {
-	ret, err := c.Client.Update(in.(ClusterRoleRuleOwner).ClusterRole)
+	ret, err := c.Client.Update(context.TODO(), in.(ClusterRoleRuleOwner).ClusterRole, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}

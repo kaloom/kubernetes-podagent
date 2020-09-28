@@ -43,28 +43,31 @@ limitations under the License.
 package common
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo"
 )
 
 // These tests need privileged containers, which are disabled by default.  Run
-// the test with "go run hack/e2e.go ... --ginkgo.focus=[Feature:Volumes]"
-var _ = Describe("[sig-storage] GCP Volumes", func() {
+// tests with "--ginkgo.focus=[Feature:Volumes]"
+var _ = ginkgo.Describe("[sig-storage] GCP Volumes", func() {
 	f := framework.NewDefaultFramework("gcp-volume")
 
-	// If 'false', the test won't clear its volumes upon completion. Useful for debugging,
 	// note that namespace deletion is handled by delete-namespace flag
-	clean := true
 	// filled in BeforeEach
 	var namespace *v1.Namespace
 	var c clientset.Interface
 
-	BeforeEach(func() {
-		framework.SkipUnlessNodeOSDistroIs("gci", "ubuntu")
+	ginkgo.BeforeEach(func() {
+		e2eskipper.SkipUnlessNodeOSDistroIs("gci", "ubuntu", "custom")
 
 		namespace = f.Namespace
 		c = f.ClientSet
@@ -73,20 +76,16 @@ var _ = Describe("[sig-storage] GCP Volumes", func() {
 	////////////////////////////////////////////////////////////////////////
 	// NFS
 	////////////////////////////////////////////////////////////////////////
-	Describe("NFSv4", func() {
-		It("should be mountable for NFSv4", func() {
-			config, _, serverIP := framework.NewNFSServer(c, namespace.Name, []string{})
-			defer func() {
-				if clean {
-					framework.VolumeTestCleanup(f, config)
-				}
-			}()
+	ginkgo.Describe("NFSv4", func() {
+		ginkgo.It("should be mountable for NFSv4", func() {
+			config, _, serverHost := e2evolume.NewNFSServer(c, namespace.Name, []string{})
+			defer e2evolume.TestServerCleanup(f, config)
 
-			tests := []framework.VolumeTest{
+			tests := []e2evolume.Test{
 				{
 					Volume: v1.VolumeSource{
 						NFS: &v1.NFSVolumeSource{
-							Server:   serverIP,
+							Server:   serverHost,
 							Path:     "/",
 							ReadOnly: true,
 						},
@@ -97,24 +96,20 @@ var _ = Describe("[sig-storage] GCP Volumes", func() {
 			}
 
 			// Must match content of test/images/volumes-tester/nfs/index.html
-			framework.TestVolumeClient(c, config, nil, tests)
+			e2evolume.TestVolumeClient(f, config, nil, "" /* fsType */, tests)
 		})
 	})
 
-	Describe("NFSv3", func() {
-		It("should be mountable for NFSv3", func() {
-			config, _, serverIP := framework.NewNFSServer(c, namespace.Name, []string{})
-			defer func() {
-				if clean {
-					framework.VolumeTestCleanup(f, config)
-				}
-			}()
+	ginkgo.Describe("NFSv3", func() {
+		ginkgo.It("should be mountable for NFSv3", func() {
+			config, _, serverHost := e2evolume.NewNFSServer(c, namespace.Name, []string{})
+			defer e2evolume.TestServerCleanup(f, config)
 
-			tests := []framework.VolumeTest{
+			tests := []e2evolume.Test{
 				{
 					Volume: v1.VolumeSource{
 						NFS: &v1.NFSVolumeSource{
-							Server:   serverIP,
+							Server:   serverHost,
 							Path:     "/exports",
 							ReadOnly: true,
 						},
@@ -124,27 +119,27 @@ var _ = Describe("[sig-storage] GCP Volumes", func() {
 				},
 			}
 			// Must match content of test/images/volume-tester/nfs/index.html
-			framework.TestVolumeClient(c, config, nil, tests)
+			e2evolume.TestVolumeClient(f, config, nil, "" /* fsType */, tests)
 		})
 	})
 
 	////////////////////////////////////////////////////////////////////////
 	// Gluster
 	////////////////////////////////////////////////////////////////////////
-	Describe("GlusterFS", func() {
-		It("should be mountable", func() {
+	ginkgo.Describe("GlusterFS", func() {
+		ginkgo.It("should be mountable", func() {
 			// create gluster server and endpoints
-			config, _, _ := framework.NewGlusterfsServer(c, namespace.Name)
+			config, _, _ := e2evolume.NewGlusterfsServer(c, namespace.Name)
 			name := config.Prefix + "-server"
 			defer func() {
-				if clean {
-					framework.VolumeTestCleanup(f, config)
-					err := c.Core().Endpoints(namespace.Name).Delete(name, nil)
-					Expect(err).NotTo(HaveOccurred(), "defer: Gluster delete endpoints failed")
+				e2evolume.TestServerCleanup(f, config)
+				err := c.CoreV1().Endpoints(namespace.Name).Delete(context.TODO(), name, metav1.DeleteOptions{})
+				if !apierrors.IsNotFound(err) {
+					framework.ExpectNoError(err, "defer: Gluster delete endpoints failed")
 				}
 			}()
 
-			tests := []framework.VolumeTest{
+			tests := []e2evolume.Test{
 				{
 					Volume: v1.VolumeSource{
 						Glusterfs: &v1.GlusterfsVolumeSource{
@@ -159,7 +154,7 @@ var _ = Describe("[sig-storage] GCP Volumes", func() {
 					ExpectedContent: "Hello from GlusterFS!",
 				},
 			}
-			framework.TestVolumeClient(c, config, nil, tests)
+			e2evolume.TestVolumeClient(f, config, nil, "" /* fsType */, tests)
 		})
 	})
 })

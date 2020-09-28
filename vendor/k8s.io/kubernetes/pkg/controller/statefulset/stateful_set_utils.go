@@ -23,7 +23,7 @@ import (
 	"regexp"
 	"strconv"
 
-	apps "k8s.io/api/apps/v1beta1"
+	apps "k8s.io/api/apps/v1"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,12 +34,6 @@ import (
 	"k8s.io/kubernetes/pkg/controller/history"
 )
 
-// maxUpdateRetries is the maximum number of retries used for update conflict resolution prior to failure
-const maxUpdateRetries = 10
-
-// updateConflictError is the error used to indicate that the maximum number of retries against the API server have
-// been attempted and we need to back off
-var updateConflictError = fmt.Errorf("aborting update after %d attempts", maxUpdateRetries)
 var patchCodec = scheme.Codecs.LegacyCodec(apps.SchemeGroupVersion)
 
 // overlappingStatefulSets sorts a list of StatefulSets by creation timestamp, using their names as a tie breaker.
@@ -112,7 +106,8 @@ func identityMatches(set *apps.StatefulSet, pod *v1.Pod) bool {
 	return ordinal >= 0 &&
 		set.Name == parent &&
 		pod.Name == getPodName(set, ordinal) &&
-		pod.Namespace == set.Namespace
+		pod.Namespace == set.Namespace &&
+		pod.Labels[apps.StatefulSetPodNameLabel] == pod.Name
 }
 
 // storageMatches returns true if pod's Volumes cover the set of PersistentVolumeClaims
@@ -148,7 +143,13 @@ func getPersistentVolumeClaims(set *apps.StatefulSet, pod *v1.Pod) map[string]v1
 		claim := templates[i]
 		claim.Name = getPersistentVolumeClaimName(set, &claim, ordinal)
 		claim.Namespace = set.Namespace
-		claim.Labels = set.Spec.Selector.MatchLabels
+		if claim.Labels != nil {
+			for key, value := range set.Spec.Selector.MatchLabels {
+				claim.Labels[key] = value
+			}
+		} else {
+			claim.Labels = set.Spec.Selector.MatchLabels
+		}
 		claims[templates[i].Name] = claim
 	}
 	return claims
@@ -187,11 +188,15 @@ func initIdentity(set *apps.StatefulSet, pod *v1.Pod) {
 	pod.Spec.Subdomain = set.Spec.ServiceName
 }
 
-// updateIdentity updates pod's name, hostname, and subdomain to conform to set's name and headless service.
+// updateIdentity updates pod's name, hostname, and subdomain, and StatefulSetPodNameLabel to conform to set's name
+// and headless service.
 func updateIdentity(set *apps.StatefulSet, pod *v1.Pod) {
 	pod.Name = getPodName(set, getOrdinal(pod))
 	pod.Namespace = set.Namespace
-
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+	pod.Labels[apps.StatefulSetPodNameLabel] = pod.Name
 }
 
 // isRunningAndReady returns true if pod is in the PodRunning Phase, if it has a condition of PodReady.
@@ -307,13 +312,9 @@ func newRevision(set *apps.StatefulSet, revision int64, collisionCount *int32) (
 	if err != nil {
 		return nil, err
 	}
-	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
-	if err != nil {
-		return nil, err
-	}
 	cr, err := history.NewControllerRevision(set,
 		controllerKind,
-		selector,
+		set.Spec.Template.Labels,
 		runtime.RawExtension{Raw: patch},
 		revision,
 		collisionCount)
@@ -337,11 +338,12 @@ func ApplyRevision(set *apps.StatefulSet, revision *apps.ControllerRevision) (*a
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(patched, clone)
+	restoredSet := &apps.StatefulSet{}
+	err = json.Unmarshal(patched, restoredSet)
 	if err != nil {
 		return nil, err
 	}
-	return clone, nil
+	return restoredSet, nil
 }
 
 // nextRevision finds the next valid revision number based on revisions. If the length of revisions
@@ -358,8 +360,7 @@ func nextRevision(revisions []*apps.ControllerRevision) int64 {
 // inconsistentStatus returns true if the ObservedGeneration of status is greater than set's
 // Generation or if any of the status's fields do not match those of set's status.
 func inconsistentStatus(set *apps.StatefulSet, status *apps.StatefulSetStatus) bool {
-	return set.Status.ObservedGeneration == nil ||
-		*status.ObservedGeneration > *set.Status.ObservedGeneration ||
+	return status.ObservedGeneration > set.Status.ObservedGeneration ||
 		status.Replicas != set.Status.Replicas ||
 		status.CurrentReplicas != set.Status.CurrentReplicas ||
 		status.ReadyReplicas != set.Status.ReadyReplicas ||

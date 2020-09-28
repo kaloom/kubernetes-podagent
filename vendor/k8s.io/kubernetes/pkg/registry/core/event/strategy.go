@@ -17,20 +17,22 @@ limitations under the License.
 package event
 
 import (
+	"context"
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/api/validation"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 )
 
 type eventStrategy struct {
@@ -38,11 +40,11 @@ type eventStrategy struct {
 	names.NameGenerator
 }
 
-// Strategy is the default logic that pplies when creating and updating
+// Strategy is the default logic that applies when creating and updating
 // Event objects via the REST API.
 var Strategy = eventStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
-func (eventStrategy) DefaultGarbageCollectionPolicy() rest.GarbageCollectionPolicy {
+func (eventStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
 	return rest.Unsupported
 }
 
@@ -50,15 +52,16 @@ func (eventStrategy) NamespaceScoped() bool {
 	return true
 }
 
-func (eventStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
+func (eventStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 }
 
-func (eventStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
+func (eventStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 }
 
-func (eventStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
+func (eventStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+	groupVersion := requestGroupVersion(ctx)
 	event := obj.(*api.Event)
-	return validation.ValidateEvent(event)
+	return validation.ValidateEventCreate(event, groupVersion)
 }
 
 // Canonicalize normalizes the object after validation.
@@ -69,9 +72,11 @@ func (eventStrategy) AllowCreateOnUpdate() bool {
 	return true
 }
 
-func (eventStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
+func (eventStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	groupVersion := requestGroupVersion(ctx)
 	event := obj.(*api.Event)
-	return validation.ValidateEvent(event)
+	oldEvent := obj.(*api.Event)
+	return validation.ValidateEventUpdate(event, oldEvent, groupVersion)
 }
 
 func (eventStrategy) AllowUnconditionalUpdate() bool {
@@ -79,15 +84,16 @@ func (eventStrategy) AllowUnconditionalUpdate() bool {
 }
 
 // GetAttrs returns labels and fields of a given object for filtering purposes.
-func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	event, ok := obj.(*api.Event)
 	if !ok {
-		return nil, nil, false, fmt.Errorf("not an event")
+		return nil, nil, fmt.Errorf("not an event")
 	}
-	return labels.Set(event.Labels), EventToSelectableFields(event), event.Initializers != nil, nil
+	return labels.Set(event.Labels), ToSelectableFields(event), nil
 }
 
-func MatchEvent(label labels.Selector, field fields.Selector) storage.SelectionPredicate {
+// Matcher returns a selection predicate for a given label and field selector.
+func Matcher(label labels.Selector, field fields.Selector) storage.SelectionPredicate {
 	return storage.SelectionPredicate{
 		Label:    label,
 		Field:    field,
@@ -95,9 +101,13 @@ func MatchEvent(label labels.Selector, field fields.Selector) storage.SelectionP
 	}
 }
 
-// EventToSelectableFields returns a field set that represents the object
-func EventToSelectableFields(event *api.Event) fields.Set {
+// ToSelectableFields returns a field set that represents the object.
+func ToSelectableFields(event *api.Event) fields.Set {
 	objectMetaFieldsSet := generic.ObjectMetaFieldsSet(&event.ObjectMeta, true)
+	source := event.Source.Component
+	if source == "" {
+		source = event.ReportingController
+	}
 	specificFieldsSet := fields.Set{
 		"involvedObject.kind":            event.InvolvedObject.Kind,
 		"involvedObject.namespace":       event.InvolvedObject.Namespace,
@@ -107,8 +117,17 @@ func EventToSelectableFields(event *api.Event) fields.Set {
 		"involvedObject.resourceVersion": event.InvolvedObject.ResourceVersion,
 		"involvedObject.fieldPath":       event.InvolvedObject.FieldPath,
 		"reason":                         event.Reason,
-		"source":                         event.Source.Component,
+		"reportingComponent":             event.ReportingController, // use the core/v1 field name
+		"source":                         source,
 		"type":                           event.Type,
 	}
 	return generic.MergeFieldsSets(objectMetaFieldsSet, specificFieldsSet)
+}
+
+// requestGroupVersion returns the group/version associated with the given context, or a zero-value group/version.
+func requestGroupVersion(ctx context.Context) schema.GroupVersion {
+	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
+		return schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
+	}
+	return schema.GroupVersion{}
 }

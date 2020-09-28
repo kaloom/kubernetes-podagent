@@ -17,6 +17,8 @@ limitations under the License.
 package v1beta1
 
 import (
+	"math"
+
 	"k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -110,6 +112,18 @@ func SetDefaults_Deployment(obj *extensionsv1beta1.Deployment) {
 			strategy.RollingUpdate.MaxSurge = &maxSurge
 		}
 	}
+	// Set extensionsv1beta1.DeploymentSpec.ProgressDeadlineSeconds to MaxInt,
+	// which has the same meaning as unset.
+	if obj.Spec.ProgressDeadlineSeconds == nil {
+		obj.Spec.ProgressDeadlineSeconds = new(int32)
+		*obj.Spec.ProgressDeadlineSeconds = math.MaxInt32
+	}
+	// Set extensionsv1beta1.DeploymentSpec.RevisionHistoryLimit to MaxInt32,
+	// which has the same meaning as unset.
+	if obj.Spec.RevisionHistoryLimit == nil {
+		obj.Spec.RevisionHistoryLimit = new(int32)
+		*obj.Spec.RevisionHistoryLimit = math.MaxInt32
+	}
 }
 
 func SetDefaults_ReplicaSet(obj *extensionsv1beta1.ReplicaSet) {
@@ -149,5 +163,12 @@ func SetDefaults_NetworkPolicy(obj *extensionsv1beta1.NetworkPolicy) {
 		if len(obj.Spec.Egress) != 0 {
 			obj.Spec.PolicyTypes = append(obj.Spec.PolicyTypes, extensionsv1beta1.PolicyTypeEgress)
 		}
+	}
+}
+
+func SetDefaults_HTTPIngressPath(obj *extensionsv1beta1.HTTPIngressPath) {
+	var defaultPathType = extensionsv1beta1.PathTypeImplementationSpecific
+	if obj.PathType == nil {
+		obj.PathType = &defaultPathType
 	}
 }

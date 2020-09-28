@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -34,12 +34,14 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
+// Controller demonstrates how to implement a controller with client-go.
 type Controller struct {
 	indexer  cache.Indexer
 	queue    workqueue.RateLimitingInterface
 	informer cache.Controller
 }
 
+// NewController creates a new Controller.
 func NewController(queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller) *Controller {
 	return &Controller{
 		informer: informer,
@@ -72,7 +74,7 @@ func (c *Controller) processNextItem() bool {
 func (c *Controller) syncToStdout(key string) error {
 	obj, exists, err := c.indexer.GetByKey(key)
 	if err != nil {
-		glog.Errorf("Fetching object with key %s from store failed with %v", key, err)
+		klog.Errorf("Fetching object with key %s from store failed with %v", key, err)
 		return err
 	}
 
@@ -99,7 +101,7 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	// This controller retries 5 times if something goes wrong. After that, it stops trying.
 	if c.queue.NumRequeues(key) < 5 {
-		glog.Infof("Error syncing pod %v: %v", key, err)
+		klog.Infof("Error syncing pod %v: %v", key, err)
 
 		// Re-enqueue the key rate limited. Based on the rate limiter on the
 		// queue and the re-enqueue history, the key will be processed later again.
@@ -110,15 +112,16 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	c.queue.Forget(key)
 	// Report to an external entity that, even after several retries, we could not successfully process this key
 	runtime.HandleError(err)
-	glog.Infof("Dropping pod %q out of the queue: %v", key, err)
+	klog.Infof("Dropping pod %q out of the queue: %v", key, err)
 }
 
+// Run begins watching and syncing.
 func (c *Controller) Run(threadiness int, stopCh chan struct{}) {
 	defer runtime.HandleCrash()
 
 	// Let the workers stop when we are done
 	defer c.queue.ShutDown()
-	glog.Info("Starting Pod controller")
+	klog.Info("Starting Pod controller")
 
 	go c.informer.Run(stopCh)
 
@@ -133,7 +136,7 @@ func (c *Controller) Run(threadiness int, stopCh chan struct{}) {
 	}
 
 	<-stopCh
-	glog.Info("Stopping Pod controller")
+	klog.Info("Stopping Pod controller")
 }
 
 func (c *Controller) runWorker() {
@@ -152,13 +155,13 @@ func main() {
 	// creates the connection
 	config, err := clientcmd.BuildConfigFromFlags(master, kubeconfig)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 
 	// creates the clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 
 	// create the pod watcher

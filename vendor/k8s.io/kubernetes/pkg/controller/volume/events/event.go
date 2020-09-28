@@ -16,8 +16,8 @@ limitations under the License.
 
 package events
 
+// volume relevant event reasons
 const (
-	// volume relevant event reasons
 	FailedBinding             = "FailedBinding"
 	VolumeMismatch            = "VolumeMismatch"
 	VolumeFailedRecycle       = "VolumeFailedRecycle"
@@ -29,4 +29,7 @@ const (
 	ProvisioningFailed        = "ProvisioningFailed"
 	ProvisioningCleanupFailed = "ProvisioningCleanupFailed"
 	ProvisioningSucceeded     = "ProvisioningSucceeded"
+	WaitForFirstConsumer      = "WaitForFirstConsumer"
+	WaitForPodScheduled       = "WaitForPodScheduled"
+	ExternalExpanding         = "ExternalExpanding"
 )

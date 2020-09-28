@@ -18,106 +18,320 @@ package metrics
 
 import (
 	"bufio"
-	//"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	utilnet "k8s.io/apimachinery/pkg/util/net"
+	restful "github.com/emicklei/go-restful"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+	"k8s.io/apimachinery/pkg/types"
+	utilsets "k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/endpoints/request"
-
-	"github.com/emicklei/go-restful"
-	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	compbasemetrics "k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
 )
 
+// resettableCollector is the interface implemented by prometheus.MetricVec
+// that can be used by Prometheus to collect metrics and reset their values.
+type resettableCollector interface {
+	compbasemetrics.Registerable
+	Reset()
+}
+
+const (
+	APIServerComponent string = "apiserver"
+	OtherContentType   string = "other"
+	OtherRequestMethod string = "other"
+)
+
+/*
+ * By default, all the following metrics are defined as falling under
+ * ALPHA stability level https://github.com/kubernetes/enhancements/blob/master/keps/sig-instrumentation/20190404-kubernetes-control-plane-metrics-stability.md#stability-classes)
+ *
+ * Promoting the stability level of the metric is a responsibility of the component owner, since it
+ * involves explicitly acknowledging support for the metric across multiple releases, in accordance with
+ * the metric stability policy.
+ */
 var (
+	deprecatedRequestGauge = compbasemetrics.NewGaugeVec(
+		&compbasemetrics.GaugeOpts{
+			Name:           "apiserver_requested_deprecated_apis",
+			Help:           "Gauge of deprecated APIs that have been requested, broken out by API group, version, resource, subresource, and removed_release.",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "version", "resource", "subresource", "removed_release"},
+	)
+
 	// TODO(a-robinson): Add unit tests for the handling of these metrics once
 	// the upstream library supports it.
-	requestCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "apiserver_request_count",
-			Help: "Counter of apiserver requests broken out for each verb, API resource, client, and HTTP response contentType and code.",
+	requestCounter = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Name:           "apiserver_request_total",
+			Help:           "Counter of apiserver requests broken out for each verb, dry run value, group, version, resource, scope, component, and HTTP response contentType and code.",
+			StabilityLevel: compbasemetrics.ALPHA,
 		},
-		[]string{"verb", "resource", "subresource", "scope", "client", "contentType", "code"},
+		// The label_name contentType doesn't follow the label_name convention defined here:
+		// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/instrumentation.md
+		// But changing it would break backwards compatibility. Future label_names
+		// should be all lowercase and separated by underscores.
+		[]string{"verb", "dry_run", "group", "version", "resource", "subresource", "scope", "component", "contentType", "code"},
 	)
-	longRunningRequestGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "apiserver_longrunning_gauge",
-			Help: "Gauge of all active long-running apiserver requests broken out by verb, API resource, and scope. Not all requests are tracked this way.",
+	longRunningRequestGauge = compbasemetrics.NewGaugeVec(
+		&compbasemetrics.GaugeOpts{
+			Name:           "apiserver_longrunning_gauge",
+			Help:           "Gauge of all active long-running apiserver requests broken out by verb, group, version, resource, scope and component. Not all requests are tracked this way.",
+			StabilityLevel: compbasemetrics.ALPHA,
 		},
-		[]string{"verb", "resource", "subresource", "scope"},
+		[]string{"verb", "group", "version", "resource", "subresource", "scope", "component"},
 	)
-	requestLatencies = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name: "apiserver_request_latencies",
-			Help: "Response latency distribution in microseconds for each verb, resource and subresource.",
-			// Use buckets ranging from 125 ms to 8 seconds.
-			Buckets: prometheus.ExponentialBuckets(125000, 2.0, 7),
+	requestLatencies = compbasemetrics.NewHistogramVec(
+		&compbasemetrics.HistogramOpts{
+			Name: "apiserver_request_duration_seconds",
+			Help: "Response latency distribution in seconds for each verb, dry run value, group, version, resource, subresource, scope and component.",
+			// This metric is used for verifying api call latencies SLO,
+			// as well as tracking regressions in this aspects.
+			// Thus we customize buckets significantly, to empower both usecases.
+			Buckets: []float64{0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+				1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 40, 50, 60},
+			StabilityLevel: compbasemetrics.ALPHA,
 		},
-		[]string{"verb", "resource", "subresource", "scope"},
+		[]string{"verb", "dry_run", "group", "version", "resource", "subresource", "scope", "component"},
 	)
-	requestLatenciesSummary = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Name: "apiserver_request_latencies_summary",
-			Help: "Response latency summary in microseconds for each verb, resource and subresource.",
-			// Make the sliding window of 5h.
-			// TODO: The value for this should be based on our SLI definition (medium term).
-			MaxAge: 5 * time.Hour,
-		},
-		[]string{"verb", "resource", "subresource", "scope"},
-	)
-	responseSizes = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
+	responseSizes = compbasemetrics.NewHistogramVec(
+		&compbasemetrics.HistogramOpts{
 			Name: "apiserver_response_sizes",
-			Help: "Response size distribution in bytes for each verb, resource, subresource and scope (namespace/cluster).",
+			Help: "Response size distribution in bytes for each group, version, verb, resource, subresource, scope and component.",
 			// Use buckets ranging from 1000 bytes (1KB) to 10^9 bytes (1GB).
-			Buckets: prometheus.ExponentialBuckets(1000, 10.0, 7),
+			Buckets:        compbasemetrics.ExponentialBuckets(1000, 10.0, 7),
+			StabilityLevel: compbasemetrics.ALPHA,
 		},
-		[]string{"verb", "resource", "subresource", "scope"},
+		[]string{"verb", "group", "version", "resource", "subresource", "scope", "component"},
+	)
+	// DroppedRequests is a number of requests dropped with 'Try again later' response"
+	DroppedRequests = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Name:           "apiserver_dropped_requests_total",
+			Help:           "Number of requests dropped with 'Try again later' response",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"request_kind"},
+	)
+	// TLSHandshakeErrors is a number of requests dropped with 'TLS handshake error from' error
+	TLSHandshakeErrors = compbasemetrics.NewCounter(
+		&compbasemetrics.CounterOpts{
+			Name:           "apiserver_tls_handshake_errors_total",
+			Help:           "Number of requests dropped with 'TLS handshake error from' error",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+	)
+	// RegisteredWatchers is a number of currently registered watchers splitted by resource.
+	RegisteredWatchers = compbasemetrics.NewGaugeVec(
+		&compbasemetrics.GaugeOpts{
+			Name:           "apiserver_registered_watchers",
+			Help:           "Number of currently registered watchers for a given resources",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "version", "kind"},
+	)
+	WatchEvents = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Name:           "apiserver_watch_events_total",
+			Help:           "Number of events sent in watch clients",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "version", "kind"},
+	)
+	WatchEventsSizes = compbasemetrics.NewHistogramVec(
+		&compbasemetrics.HistogramOpts{
+			Name:           "apiserver_watch_events_sizes",
+			Help:           "Watch event size distribution in bytes",
+			Buckets:        compbasemetrics.ExponentialBuckets(1024, 2.0, 8), // 1K, 2K, 4K, 8K, ..., 128K.
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "version", "kind"},
+	)
+	// Because of volatility of the base metric this is pre-aggregated one. Instead of reporting current usage all the time
+	// it reports maximal usage during the last second.
+	currentInflightRequests = compbasemetrics.NewGaugeVec(
+		&compbasemetrics.GaugeOpts{
+			Name:           "apiserver_current_inflight_requests",
+			Help:           "Maximal number of currently used inflight request limit of this apiserver per request kind in last second.",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"request_kind"},
+	)
+	currentInqueueRequests = compbasemetrics.NewGaugeVec(
+		&compbasemetrics.GaugeOpts{
+			Name:           "apiserver_current_inqueue_requests",
+			Help:           "Maximal number of queued requests in this apiserver per request kind in last second.",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"request_kind"},
+	)
+
+	requestTerminationsTotal = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Name:           "apiserver_request_terminations_total",
+			Help:           "Number of requests which apiserver terminated in self-defense.",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"verb", "group", "version", "resource", "subresource", "scope", "component", "code"},
 	)
 	kubectlExeRegexp = regexp.MustCompile(`^.*((?i:kubectl\.exe))`)
+
+	metrics = []resettableCollector{
+		deprecatedRequestGauge,
+		requestCounter,
+		longRunningRequestGauge,
+		requestLatencies,
+		responseSizes,
+		DroppedRequests,
+		TLSHandshakeErrors,
+		RegisteredWatchers,
+		WatchEvents,
+		WatchEventsSizes,
+		currentInflightRequests,
+		currentInqueueRequests,
+		requestTerminationsTotal,
+	}
+
+	// these are the known (e.g. whitelisted/known) content types which we will report for
+	// request metrics. Any other RFC compliant content types will be aggregated under 'unknown'
+	knownMetricContentTypes = utilsets.NewString(
+		"application/apply-patch+yaml",
+		"application/json",
+		"application/json-patch+json",
+		"application/merge-patch+json",
+		"application/strategic-merge-patch+json",
+		"application/vnd.kubernetes.protobuf",
+		"application/vnd.kubernetes.protobuf;stream=watch",
+		"application/yaml",
+		"text/plain",
+		"text/plain;charset=utf-8")
+	// these are the valid request methods which we report in our metrics. Any other request methods
+	// will be aggregated under 'unknown'
+	validRequestMethods = utilsets.NewString(
+		"APPLY",
+		"CONNECT",
+		"CREATE",
+		"DELETE",
+		"DELETECOLLECTION",
+		"GET",
+		"LIST",
+		"PATCH",
+		"POST",
+		"PROXY",
+		"PUT",
+		"UPDATE",
+		"WATCH",
+		"WATCHLIST")
 )
+
+const (
+	// ReadOnlyKind is a string identifying read only request kind
+	ReadOnlyKind = "readOnly"
+	// MutatingKind is a string identifying mutating request kind
+	MutatingKind = "mutating"
+
+	// WaitingPhase is the phase value for a request waiting in a queue
+	WaitingPhase = "waiting"
+	// ExecutingPhase is the phase value for an executing request
+	ExecutingPhase = "executing"
+)
+
+const (
+	// deprecatedAnnotationKey is a key for an audit annotation set to
+	// "true" on requests made to deprecated API versions
+	deprecatedAnnotationKey = "k8s.io/deprecated"
+	// removedReleaseAnnotationKey is a key for an audit annotation set to
+	// the target removal release, in "<major>.<minor>" format,
+	// on requests made to deprecated API versions with a target removal release
+	removedReleaseAnnotationKey = "k8s.io/removed-release"
+)
+
+var registerMetrics sync.Once
 
 // Register all metrics.
 func Register() {
-	prometheus.MustRegister(requestCounter)
-	prometheus.MustRegister(longRunningRequestGauge)
-	prometheus.MustRegister(requestLatencies)
-	prometheus.MustRegister(requestLatenciesSummary)
-	prometheus.MustRegister(responseSizes)
+	registerMetrics.Do(func() {
+		for _, metric := range metrics {
+			legacyregistry.MustRegister(metric)
+		}
+	})
 }
 
-// Record records a single request to the standard metrics endpoints. For use by handlers that perform their own
-// processing. All API paths should use InstrumentRouteFunc implicitly. Use this instead of MonitorRequest if
-// you already have a RequestInfo object.
-func Record(req *http.Request, requestInfo *request.RequestInfo, contentType string, code int, responseSizeInBytes int, elapsed time.Duration) {
+// Reset all metrics.
+func Reset() {
+	for _, metric := range metrics {
+		metric.Reset()
+	}
+}
+
+// UpdateInflightRequestMetrics reports concurrency metrics classified by
+// mutating vs Readonly.
+func UpdateInflightRequestMetrics(phase string, nonmutating, mutating int) {
+	for _, kc := range []struct {
+		kind  string
+		count int
+	}{{ReadOnlyKind, nonmutating}, {MutatingKind, mutating}} {
+		if phase == ExecutingPhase {
+			currentInflightRequests.WithLabelValues(kc.kind).Set(float64(kc.count))
+		} else {
+			currentInqueueRequests.WithLabelValues(kc.kind).Set(float64(kc.count))
+		}
+	}
+}
+
+// RecordRequestTermination records that the request was terminated early as part of a resource
+// preservation or apiserver self-defense mechanism (e.g. timeouts, maxinflight throttling,
+// proxyHandler errors). RecordRequestTermination should only be called zero or one times
+// per request.
+func RecordRequestTermination(req *http.Request, requestInfo *request.RequestInfo, component string, code int) {
 	if requestInfo == nil {
 		requestInfo = &request.RequestInfo{Verb: req.Method, Path: req.URL.Path}
 	}
-	scope := cleanScope(requestInfo)
+	scope := CleanScope(requestInfo)
+
+	// We don't use verb from <requestInfo>, as this may be propagated from
+	// InstrumentRouteFunc which is registered in installer.go with predefined
+	// list of verbs (different than those translated to RequestInfo).
+	// However, we need to tweak it e.g. to differentiate GET from LIST.
+	reportedVerb := cleanVerb(canonicalVerb(strings.ToUpper(req.Method), scope), req)
+
 	if requestInfo.IsResourceRequest {
-		MonitorRequest(req, strings.ToUpper(requestInfo.Verb), requestInfo.Resource, requestInfo.Subresource, contentType, scope, code, responseSizeInBytes, elapsed)
+		requestTerminationsTotal.WithLabelValues(reportedVerb, requestInfo.APIGroup, requestInfo.APIVersion, requestInfo.Resource, requestInfo.Subresource, scope, component, codeToString(code)).Inc()
 	} else {
-		MonitorRequest(req, strings.ToUpper(requestInfo.Verb), "", requestInfo.Path, contentType, scope, code, responseSizeInBytes, elapsed)
+		requestTerminationsTotal.WithLabelValues(reportedVerb, "", "", "", requestInfo.Path, scope, component, codeToString(code)).Inc()
 	}
 }
 
 // RecordLongRunning tracks the execution of a long running request against the API server. It provides an accurate count
 // of the total number of open long running requests. requestInfo may be nil if the caller is not in the normal request flow.
-func RecordLongRunning(req *http.Request, requestInfo *request.RequestInfo, fn func()) {
+func RecordLongRunning(req *http.Request, requestInfo *request.RequestInfo, component string, fn func()) {
 	if requestInfo == nil {
 		requestInfo = &request.RequestInfo{Verb: req.Method, Path: req.URL.Path}
 	}
-	var g prometheus.Gauge
-	scope := cleanScope(requestInfo)
-	reportedVerb := cleanVerb(strings.ToUpper(requestInfo.Verb), req)
+	var g compbasemetrics.GaugeMetric
+	scope := CleanScope(requestInfo)
+
+	// We don't use verb from <requestInfo>, as this may be propagated from
+	// InstrumentRouteFunc which is registered in installer.go with predefined
+	// list of verbs (different than those translated to RequestInfo).
+	// However, we need to tweak it e.g. to differentiate GET from LIST.
+	reportedVerb := cleanVerb(canonicalVerb(strings.ToUpper(req.Method), scope), req)
+
 	if requestInfo.IsResourceRequest {
-		g = longRunningRequestGauge.WithLabelValues(reportedVerb, requestInfo.Resource, requestInfo.Subresource, scope)
+		g = longRunningRequestGauge.WithLabelValues(reportedVerb, requestInfo.APIGroup, requestInfo.APIVersion, requestInfo.Resource, requestInfo.Subresource, scope, component)
 	} else {
-		g = longRunningRequestGauge.WithLabelValues(reportedVerb, "", requestInfo.Path, scope)
+		g = longRunningRequestGauge.WithLabelValues(reportedVerb, "", "", "", requestInfo.Path, scope, component)
 	}
 	g.Inc()
 	defer g.Dec()
@@ -126,29 +340,34 @@ func RecordLongRunning(req *http.Request, requestInfo *request.RequestInfo, fn f
 
 // MonitorRequest handles standard transformations for client and the reported verb and then invokes Monitor to record
 // a request. verb must be uppercase to be backwards compatible with existing monitoring tooling.
-func MonitorRequest(req *http.Request, verb, resource, subresource, scope, contentType string, httpCode, respSize int, elapsed time.Duration) {
-	reportedVerb := cleanVerb(verb, req)
-	client := cleanUserAgent(utilnet.GetHTTPClient(req))
-	elapsedMicroseconds := float64(elapsed / time.Microsecond)
-	requestCounter.WithLabelValues(reportedVerb, resource, subresource, scope, client, contentType, codeToString(httpCode)).Inc()
-	requestLatencies.WithLabelValues(reportedVerb, resource, subresource, scope).Observe(elapsedMicroseconds)
-	requestLatenciesSummary.WithLabelValues(reportedVerb, resource, subresource, scope).Observe(elapsedMicroseconds)
+func MonitorRequest(req *http.Request, verb, group, version, resource, subresource, scope, component string, deprecated bool, removedRelease string, contentType string, httpCode, respSize int, elapsed time.Duration) {
+	// We don't use verb from <requestInfo>, as this may be propagated from
+	// InstrumentRouteFunc which is registered in installer.go with predefined
+	// list of verbs (different than those translated to RequestInfo).
+	// However, we need to tweak it e.g. to differentiate GET from LIST.
+	reportedVerb := cleanVerb(canonicalVerb(strings.ToUpper(req.Method), scope), req)
+
+	dryRun := cleanDryRun(req.URL)
+	elapsedSeconds := elapsed.Seconds()
+	cleanContentType := cleanContentType(contentType)
+	requestCounter.WithLabelValues(reportedVerb, dryRun, group, version, resource, subresource, scope, component, cleanContentType, codeToString(httpCode)).Inc()
+	if deprecated {
+		deprecatedRequestGauge.WithLabelValues(group, version, resource, subresource, removedRelease).Set(1)
+		audit.AddAuditAnnotation(req.Context(), deprecatedAnnotationKey, "true")
+		if len(removedRelease) > 0 {
+			audit.AddAuditAnnotation(req.Context(), removedReleaseAnnotationKey, removedRelease)
+		}
+	}
+	requestLatencies.WithLabelValues(reportedVerb, dryRun, group, version, resource, subresource, scope, component).Observe(elapsedSeconds)
 	// We are only interested in response sizes of read requests.
 	if verb == "GET" || verb == "LIST" {
-		responseSizes.WithLabelValues(reportedVerb, resource, subresource, scope).Observe(float64(respSize))
+		responseSizes.WithLabelValues(reportedVerb, group, version, resource, subresource, scope, component).Observe(float64(respSize))
 	}
 }
 
-func Reset() {
-	requestCounter.Reset()
-	requestLatencies.Reset()
-	requestLatenciesSummary.Reset()
-	responseSizes.Reset()
-}
-
 // InstrumentRouteFunc works like Prometheus' InstrumentHandlerFunc but wraps
-// the go-restful RouteFunction instead of a HandlerFunc
-func InstrumentRouteFunc(verb, resource, subresource, scope string, routeFunc restful.RouteFunction) restful.RouteFunction {
+// the go-restful RouteFunction instead of a HandlerFunc plus some Kubernetes endpoint specific information.
+func InstrumentRouteFunc(verb, group, version, resource, subresource, scope, component string, deprecated bool, removedRelease string, routeFunc restful.RouteFunction) restful.RouteFunction {
 	return restful.RouteFunction(func(request *restful.Request, response *restful.Response) {
 		now := time.Now()
 
@@ -167,11 +386,47 @@ func InstrumentRouteFunc(verb, resource, subresource, scope string, routeFunc re
 
 		routeFunc(request, response)
 
-		MonitorRequest(request.Request, verb, resource, subresource, scope, delegate.Header().Get("Content-Type"), delegate.Status(), delegate.ContentLength(), time.Now().Sub(now))
+		MonitorRequest(request.Request, verb, group, version, resource, subresource, scope, component, deprecated, removedRelease, delegate.Header().Get("Content-Type"), delegate.Status(), delegate.ContentLength(), time.Since(now))
 	})
 }
 
-func cleanScope(requestInfo *request.RequestInfo) string {
+// InstrumentHandlerFunc works like Prometheus' InstrumentHandlerFunc but adds some Kubernetes endpoint specific information.
+func InstrumentHandlerFunc(verb, group, version, resource, subresource, scope, component string, deprecated bool, removedRelease string, handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		now := time.Now()
+
+		delegate := &ResponseWriterDelegator{ResponseWriter: w}
+
+		_, cn := w.(http.CloseNotifier)
+		_, fl := w.(http.Flusher)
+		_, hj := w.(http.Hijacker)
+		if cn && fl && hj {
+			w = &fancyResponseWriterDelegator{delegate}
+		} else {
+			w = delegate
+		}
+
+		handler(w, req)
+
+		MonitorRequest(req, verb, group, version, resource, subresource, scope, component, deprecated, removedRelease, delegate.Header().Get("Content-Type"), delegate.Status(), delegate.ContentLength(), time.Since(now))
+	}
+}
+
+// cleanContentType binds the contentType (for metrics related purposes) to a
+// bounded set of known/expected content-types.
+func cleanContentType(contentType string) string {
+	normalizedContentType := strings.ToLower(contentType)
+	if strings.HasSuffix(contentType, " stream=watch") || strings.HasSuffix(contentType, " charset=utf-8") {
+		normalizedContentType = strings.ReplaceAll(contentType, " ", "")
+	}
+	if knownMetricContentTypes.Has(normalizedContentType) {
+		return normalizedContentType
+	}
+	return OtherContentType
+}
+
+// CleanScope returns the scope of the request.
+func CleanScope(requestInfo *request.RequestInfo) string {
 	if requestInfo.Namespace != "" {
 		return "namespace"
 	}
@@ -183,6 +438,18 @@ func cleanScope(requestInfo *request.RequestInfo) string {
 	}
 	// this is the empty scope
 	return ""
+}
+
+func canonicalVerb(verb string, scope string) string {
+	switch verb {
+	case "GET", "HEAD":
+		if scope != "resource" && scope != "" {
+			return "LIST"
+		}
+		return "GET"
+	default:
+		return verb
+	}
 }
 
 func cleanVerb(verb string, request *http.Request) string {
@@ -199,17 +466,29 @@ func cleanVerb(verb string, request *http.Request) string {
 	if verb == "WATCHLIST" {
 		reportedVerb = "WATCH"
 	}
-	return reportedVerb
+	if verb == "PATCH" && request.Header.Get("Content-Type") == string(types.ApplyPatchType) && utilfeature.DefaultFeatureGate.Enabled(features.ServerSideApply) {
+		reportedVerb = "APPLY"
+	}
+	if validRequestMethods.Has(reportedVerb) {
+		return reportedVerb
+	}
+	return OtherRequestMethod
 }
 
-func cleanUserAgent(ua string) string {
-	// We collapse all "web browser"-type user agents into one "browser" to reduce metric cardinality.
-	if strings.HasPrefix(ua, "Mozilla/") {
-		return "Browser"
+func cleanDryRun(u *url.URL) string {
+	// avoid allocating when we don't see dryRun in the query
+	if !strings.Contains(u.RawQuery, "dryRun") {
+		return ""
 	}
-	// If an old "kubectl.exe" has passed us its full path, we discard the path portion.
-	ua = kubectlExeRegexp.ReplaceAllString(ua, "$1")
-	return ua
+	dryRun := u.Query()["dryRun"]
+	if errs := validation.ValidateDryRun(nil, dryRun); len(errs) > 0 {
+		return "invalid"
+	}
+	// Since dryRun could be valid with any arbitrarily long length
+	// we have to dedup and sort the elements before joining them together
+	// TODO: this is a fairly large allocation for what it does, consider
+	//   a sort and dedup in a single pass
+	return strings.Join(utilsets.NewString(dryRun...).List(), ",")
 }
 
 // ResponseWriterDelegator interface wraps http.ResponseWriter to additionally record content-length, status-code, etc.
