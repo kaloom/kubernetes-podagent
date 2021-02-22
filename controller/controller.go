@@ -49,7 +49,7 @@ func (ct ContainerType) String() string {
 	case Crio:
 		return "Crio"
 	default:
-		glog.Errorf("Invalid ContainerType: %v", ct)
+		glog.Errorf("Invalid ContainerType: %d", int(ct))
 		return fmt.Sprintf("%d", int(ct))
 	}
 }
