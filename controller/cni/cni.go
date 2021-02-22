@@ -25,10 +25,11 @@ import (
 	"strings"
 	"sync"
 
+	kc "github.com/kaloom/kubernetes-common"
+
 	"github.com/containernetworking/cni/libcni"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/kubelet/dockershim/network"
 	utilexec "k8s.io/utils/exec"
 )
 
@@ -240,7 +241,7 @@ func (plugin *NetworkPlugin) buildCNIRuntimeConf(cniParams *Parameters) (*libcni
 	rt := &libcni.RuntimeConf{
 		ContainerID: cniParams.SandboxID,
 		NetNS:       cniParams.NetnsPath,
-		IfName:      network.DefaultInterfaceName,
+		IfName:      kc.GetNetworkIfname(cniParams.NetworkName),
 		Args: [][2]string{
 			{"IgnoreUnknown", "1"},
 			{"K8S_POD_NAMESPACE", cniParams.Namespace},
