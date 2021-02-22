@@ -86,15 +86,15 @@ func (cr *CrioRuntime) GetNetNS(podSandboxID string) (string, error) {
 	glog.V(5).Infof("GetNetNS:info:%s", info)
 	err = json.Unmarshal([]byte(info), &podStatusResponseInfo)
 	if err != nil {
-		glog.Errorf("GetNetNS:error decoding response:", err)
+		glog.Errorf("GetNetNS:error decoding response: %v", err)
 		if e, ok := err.(*json.SyntaxError); ok {
-			glog.Errorf("GetNetNS:syntax error at byte offset ", e.Offset)
+			glog.Errorf("GetNetNS:syntax error at byte offset %d", e.Offset)
 		}
 		return "", err
 	}
 
 	namespaces := podStatusResponseInfo.RunTimeSpec.Linux.NameSpaces
-	glog.V(5).Infof("GetNetNS:RunTimeSpec.Linux.NameSpaces:", namespaces)
+	glog.V(5).Infof("GetNetNS:RunTimeSpec.Linux.NameSpaces: %v", namespaces)
 	for _, namespace := range namespaces {
 		if namespace.Type == "network" {
 			ss := strings.Split(namespace.Path, "/")
