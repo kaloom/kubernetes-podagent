@@ -46,6 +46,11 @@ type cniPodNetworkProperty struct {
 
 type cniPodNetworks []cniPodNetwork
 
+const (
+	maxRetries = 5
+	retryDelay = 1 * time.Second
+)
+
 func getNetworkSet(networks string) (gset.GSet, error) {
 	nets := cniPodNetworks{}
 	netSetBuilder := gset.NewBuilder()
@@ -116,7 +121,20 @@ func (c *Controller) addNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 	if err != nil {
 		return err
 	}
-	return c.cniPlugin.AddNetwork(cniParams)
+
+	for i := 0; i < maxRetries; i++ {
+		err = c.cniPlugin.AddNetwork(cniParams)
+		if err == nil {
+			if i > 0 {
+				glog.V(4).Infof("Succeeded adding network %s on Pod %s after %d attempt", networkName, podObj.ObjectMeta.Name, i)
+			}
+			break
+		}
+		glog.Warningf("Failed adding network %s on Pod %s... retrying %d/%d. err:%v", networkName, podObj.ObjectMeta.Name, i+1, maxRetries, err)
+		time.Sleep(retryDelay)
+	}
+
+	return err
 }
 
 func (c *Controller) delNetwork(podObj *apiv1.Pod, networkName string, np cniPodNetworkProperty) error {
@@ -128,7 +146,20 @@ func (c *Controller) delNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 	if err != nil {
 		return err
 	}
-	return c.cniPlugin.DeleteNetwork(cniParams)
+
+	for i := 0; i < maxRetries; i++ {
+		err = c.cniPlugin.DeleteNetwork(cniParams)
+		if err == nil {
+			if i > 0 {
+				glog.V(4).Infof("Succeeded deleting network %s on Pod %s after %d attempt", networkName, podObj.ObjectMeta.Name, i)
+			}
+			break
+		}
+		glog.Warningf("Failed deleting network %s on Pod %s... retrying %d/%d. err:%v", networkName, podObj.ObjectMeta.Name, i+1, maxRetries, err)
+		time.Sleep(retryDelay)
+	}
+
+	return err
 }
 
 func (c *Controller) podUpdated(oldObj, newObj interface{}) {
@@ -151,13 +182,19 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 			if d := oldNetSet.Difference(newNetSet); d.Size() > 0 {
 				glog.V(5).Infof("The following network(s) got deleted from Pod %s: %s", podName, d)
 				for _, netKV := range d.ToSlice() {
-					c.delNetwork(newPod, netKV.Key, netKV.Val.(cniPodNetworkProperty))
+					err := c.delNetwork(newPod, netKV.Key, netKV.Val.(cniPodNetworkProperty))
+					if err != nil {
+						glog.Errorf("Failed to delete network %s on pod %s", netKV.Key, podName)
+					}
 				}
 			}
 			if d := newNetSet.Difference(oldNetSet); d.Size() > 0 {
 				glog.V(5).Infof("The following network(s) got added to Pod %s: %s", podName, d)
 				for _, netKV := range d.ToSlice() {
-					c.addNetwork(newPod, netKV.Key, netKV.Val.(cniPodNetworkProperty))
+					err := c.addNetwork(newPod, netKV.Key, netKV.Val.(cniPodNetworkProperty))
+					if err != nil {
+						glog.Errorf("Failed to add network %s on pod %s", netKV.Key, podName)
+					}
 				}
 			}
 		} else {
@@ -170,7 +207,10 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 			np := cniPodNetworkProperty{}
 			for _, n := range nets {
 				np.IfMAC = n.IfMAC
-				c.delNetwork(newPod, n.NetworkName, np)
+				err := c.delNetwork(newPod, n.NetworkName, np)
+				if err != nil {
+					glog.Errorf("Failed to delete network %s on pod %s", n.NetworkName, podName)
+				}
 			}
 		}
 	} else if newNetworks, ok := newPod.Annotations["networks"]; ok {
@@ -183,7 +223,10 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 		np := cniPodNetworkProperty{}
 		for _, n := range nets {
 			np.IfMAC = n.IfMAC
-			c.addNetwork(newPod, n.NetworkName, np)
+			err := c.addNetwork(newPod, n.NetworkName, np)
+			if err != nil {
+				glog.V(4).Infof("Failed to add network %s on pod %s", n.NetworkName, podName)
+			}
 		}
 	}
 }
