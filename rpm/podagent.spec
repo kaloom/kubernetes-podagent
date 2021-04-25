@@ -13,7 +13,8 @@ Source2: podagent.service
 %description
 
 %prep
-for f in @@rpm_build_dir@@/*; do cp -a $f $RPM_SOURCE_DIR; done
+mkdir $RPM_SOURCE_DIR
+for f in @@rpm_build_dir@@/*; do cp -a $f $RPM_SOURCE_DIR/; done
 
 %build
 

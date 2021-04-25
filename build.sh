@@ -33,6 +33,7 @@ if [ ! -h ${GOGRADLE_PROJECT_PATH}/src/${repo_path} ]; then
     ln -s ../../../../.. ${GOGRADLE_PROJECT_PATH}/src/${repo_path}
 fi
 
+export CGO_ENABLED=0
 export GO15VENDOREXPERIMENT=1
 export GOBIN=${PWD}/bin
 export GOPATH=${PWD}/${GOGRADLE_PROJECT_PATH}
