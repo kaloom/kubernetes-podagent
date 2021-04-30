@@ -47,9 +47,50 @@ type cniPodNetworkProperty struct {
 type cniPodNetworks []cniPodNetwork
 
 const (
-	maxRetries = 5
-	retryDelay = 1 * time.Second
+	maxRetries = 60
+	retryDelay = 10 * time.Second
 )
+
+// Process will take a element from the FIFO queue and attempt to process it (either add or remove network)
+func (c *Controller) Process(e *Event) {
+	var err error
+	switch e.opType {
+	case Add:
+		for i := 0; i < maxRetries; i++ {
+			err = c.cniPlugin.AddNetwork(e.data.(*cni.Parameters))
+			if err == nil {
+				if i > 0 {
+					glog.Infof("Succeeded adding network %+v after %d attempt", e.data, i)
+				} else {
+					glog.V(5).Infof("Succeeded adding network %+v on first attempt", e.data)
+				}
+				return
+			}
+			glog.Warningf("Failed adding network %+v... retrying %d/%d. err:%v", e.data, i+1, maxRetries, err)
+			time.Sleep(retryDelay)
+		}
+		glog.Errorf("Failed adding network %+v after %d attempt. err:%v", e.data, maxRetries, err)
+
+	case Delete:
+		for i := 0; i < maxRetries; i++ {
+			err = c.cniPlugin.DeleteNetwork(e.data.(*cni.Parameters))
+			if err == nil {
+				if i > 0 {
+					glog.Infof("Succeeded deleting network %+v after %d attempt", e.data, i)
+				} else {
+					glog.V(5).Infof("Succeeded deleting network %+v on first attempt", e.data)
+				}
+				return
+			}
+			glog.Warningf("Failed deleting network %+v... retrying %d/%d. err:%v", e.data, i+1, maxRetries, err)
+			time.Sleep(retryDelay)
+		}
+		glog.Errorf("Failed deleting network %+v after %d attempt. err:%v", e.data, maxRetries, err)
+
+	default:
+		glog.Errorf("processing invalid operation type value in event %+v", e)
+	}
+}
 
 func getNetworkSet(networks string) (gset.GSet, error) {
 	nets := cniPodNetworks{}
@@ -122,19 +163,8 @@ func (c *Controller) addNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 		return err
 	}
 
-	for i := 0; i < maxRetries; i++ {
-		err = c.cniPlugin.AddNetwork(cniParams)
-		if err == nil {
-			if i > 0 {
-				glog.V(4).Infof("Succeeded adding network %s on Pod %s after %d attempt", networkName, podObj.ObjectMeta.Name, i)
-			}
-			break
-		}
-		glog.Warningf("Failed adding network %s on Pod %s... retrying %d/%d. err:%v", networkName, podObj.ObjectMeta.Name, i+1, maxRetries, err)
-		time.Sleep(retryDelay)
-	}
-
-	return err
+	c.eventQueue.Enqueue(&Event{opType: Add, data: cniParams})
+	return nil
 }
 
 func (c *Controller) delNetwork(podObj *apiv1.Pod, networkName string, np cniPodNetworkProperty) error {
@@ -147,19 +177,8 @@ func (c *Controller) delNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 		return err
 	}
 
-	for i := 0; i < maxRetries; i++ {
-		err = c.cniPlugin.DeleteNetwork(cniParams)
-		if err == nil {
-			if i > 0 {
-				glog.V(4).Infof("Succeeded deleting network %s on Pod %s after %d attempt", networkName, podObj.ObjectMeta.Name, i)
-			}
-			break
-		}
-		glog.Warningf("Failed deleting network %s on Pod %s... retrying %d/%d. err:%v", networkName, podObj.ObjectMeta.Name, i+1, maxRetries, err)
-		time.Sleep(retryDelay)
-	}
-
-	return err
+	c.eventQueue.Enqueue(&Event{opType: Delete, data: cniParams})
+	return nil
 }
 
 func (c *Controller) podUpdated(oldObj, newObj interface{}) {
@@ -207,6 +226,7 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 			np := cniPodNetworkProperty{}
 			for _, n := range nets {
 				np.IfMAC = n.IfMAC
+				np.IsPrimary = n.IsPrimary
 				err := c.delNetwork(newPod, n.NetworkName, np)
 				if err != nil {
 					glog.Errorf("Failed to delete network %s on pod %s", n.NetworkName, podName)
@@ -223,15 +243,38 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 		np := cniPodNetworkProperty{}
 		for _, n := range nets {
 			np.IfMAC = n.IfMAC
+			np.IsPrimary = n.IsPrimary
 			err := c.addNetwork(newPod, n.NetworkName, np)
 			if err != nil {
-				glog.V(4).Infof("Failed to add network %s on pod %s", n.NetworkName, podName)
+				glog.Errorf("Failed to add network %s on pod %s", n.NetworkName, podName)
 			}
 		}
 	}
 }
 
+func (c *Controller) eventQueueWorker() {
+	for {
+		c.eventQueue.cond.L.Lock()
+
+		for c.eventQueue.q.Len() == 0 {
+			c.eventQueue.cond.Wait()
+		}
+
+		ev := c.eventQueue.Dequeue()
+		c.eventQueue.cond.L.Unlock()
+
+		if ev != nil {
+			glog.V(5).Infof("Processing event:", ev)
+			c.Process(ev)
+		}
+	}
+}
+
 func (c *Controller) watchPods(ctx context.Context, nodeName string) (cache.Controller, error) {
+
+	// Initialize the worker queue
+	go c.eventQueueWorker()
+
 	// Currently there is no field selector for a Pod annotation
 	// https://github.com/kubernetes/kubernetes/blob/master/pkg/registry/core/pod/strategy.go
 	fs := fields.Set{
