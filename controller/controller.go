@@ -1,4 +1,5 @@
 /*
+/*
 Copyright 2017-2019 Kaloom Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +60,7 @@ type Controller struct {
 	kubeClient *kubernetes.Clientset
 	runtime    Runtime
 	cniPlugin  *cni.NetworkPlugin
+	eventQueue *EventQueue
 }
 
 // Run starts a Pod resource controller
@@ -111,6 +113,7 @@ func NewController(kubeClient *kubernetes.Clientset, endpoint, cniBinPath, cniCo
 		kubeClient: kubeClient,
 		runtime:    runTime,
 		cniPlugin:  cniPlugin,
+		eventQueue: newQueue(),
 	}
 	return c, nil
 }
