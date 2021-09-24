@@ -58,6 +58,9 @@ spec:
           readOnly: true
         - name: libcni
           mountPath: /var/lib/cni
+        - name: runnetns
+          mountPath:  /var/run/netns
+          mountPropagation: HostToContainer
       volumes:
       - name: hostcninet
         hostPath:
