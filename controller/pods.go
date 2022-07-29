@@ -181,6 +181,19 @@ func (c *Controller) delNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 	return nil
 }
 
+func (c *Controller) podAdded(podObj interface{}) {
+	pod := podObj.(*apiv1.Pod)
+	podName := pod.ObjectMeta.Name
+	glog.V(5).Infof("Pod added: %s", podName)
+	networks, ok := pod.Annotations["networks"]
+	if !ok {
+		glog.V(5).Infof("Pod %s does not contain any networks, skipping", podName)
+		return
+	}
+
+	c.addNetworks(pod, networks)
+}
+
 func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 	oldPod := oldObj.(*apiv1.Pod)
 	newPod := newObj.(*apiv1.Pod)
@@ -234,20 +247,26 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 			}
 		}
 	} else if newNetworks, ok := newPod.Annotations["networks"]; ok {
-		glog.V(5).Infof("Pod's %s networks annotation '%s' got added", podName, newNetworks)
-		nets, err := getNetworks(newNetworks)
+		c.addNetworks(newPod, newNetworks)
+	}
+}
+
+func (c *Controller) addNetworks(pod *apiv1.Pod, networkAnnotation string) {
+	podName := pod.ObjectMeta.Name
+	glog.V(5).Infof("Pod's %s networks annotation '%s' got added", podName, networkAnnotation)
+	nets, err := getNetworks(networkAnnotation)
+	if err != nil {
+		glog.V(4).Infof("Failed to unmarshall pod's %s new networks annotation, ignore: %s", podName, err)
+		return
+	}
+
+	np := cniPodNetworkProperty{}
+	for _, n := range nets {
+		np.IfMAC = n.IfMAC
+		np.IsPrimary = n.IsPrimary
+		err := c.addNetwork(pod, n.NetworkName, np)
 		if err != nil {
-			glog.V(4).Infof("Failed to unmarshall pod's %s new networks annotation, ignore: %s", podName, err)
-			return
-		}
-		np := cniPodNetworkProperty{}
-		for _, n := range nets {
-			np.IfMAC = n.IfMAC
-			np.IsPrimary = n.IsPrimary
-			err := c.addNetwork(newPod, n.NetworkName, np)
-			if err != nil {
-				glog.Errorf("Failed to add network %s on pod %s", n.NetworkName, podName)
-			}
+			glog.Errorf("Failed to add network %s on pod %s", n.NetworkName, podName)
 		}
 	}
 }
@@ -286,14 +305,16 @@ func (c *Controller) watchPods(ctx context.Context, nodeName string) (cache.Cont
 	fieldsToMatch := fs.AsSelector()
 	// Define what we want to look for (Pods)
 	watchlist := cache.NewListWatchFromClient(c.kubeClient.CoreV1().RESTClient(), "pods", apiv1.NamespaceAll, fieldsToMatch)
-	// batching and collapsing events is controlled by the resyncPeriod, 0 would disable the resync
-	resyncPeriod := 30 * time.Second
 	// Setup an informer to call functions when the watchlist changes
 	_, controller := cache.NewInformer(
 		watchlist,
 		&apiv1.Pod{},
-		resyncPeriod,
+		// we don't use any resync because UpdateFunc logic currently compares
+		// the annotations between the old and new objects, but during a resync,
+		// old == new so nothing happens
+		0,
 		cache.ResourceEventHandlerFuncs{
+			AddFunc: c.podAdded,
 			UpdateFunc: c.podUpdated,
 		},
 	)
