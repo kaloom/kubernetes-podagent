@@ -39,9 +39,19 @@ type cniPodNetwork struct {
 	kc.NetworkConfig
 }
 
+func (c *cniPodNetwork) ToProperty() cniPodNetworkProperty {
+	return cniPodNetworkProperty{
+		IfMAC:        c.IfMAC,
+		IsPrimary:    c.IsPrimary,
+		PodagentSkip: c.PodagentSkip,
+	}
+}
+
 type cniPodNetworkProperty struct {
 	IfMAC     string
 	IsPrimary bool
+	// PodagentSkip makes podagent skip configuring this network
+	PodagentSkip bool
 }
 
 type cniPodNetworks []cniPodNetwork
@@ -97,10 +107,8 @@ func getNetworkSet(networks string) (gset.GSet, error) {
 	netSetBuilder := gset.NewBuilder()
 	err := json.Unmarshal([]byte(networks), &nets)
 	if err == nil {
-		np := cniPodNetworkProperty{}
 		for _, n := range nets {
-			np.IfMAC = n.IfMAC
-			np.IsPrimary = n.IsPrimary
+			np := n.ToProperty()
 			netSetBuilder.Add(n.NetworkName, np)
 		}
 	}
@@ -158,6 +166,11 @@ func (c *Controller) addNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 	if np.IsPrimary {
 		return nil
 	}
+	if np.PodagentSkip {
+		glog.V(3).Infof("Skipping adding pod's %s network %s", podObj.GetName(), networkName)
+		return nil
+	}
+
 	cniParams, err := c.getCNIParams(podObj, networkName, np)
 	if err != nil {
 		return err
@@ -172,6 +185,11 @@ func (c *Controller) delNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 	if np.IsPrimary {
 		return nil
 	}
+	if np.PodagentSkip {
+		glog.V(3).Infof("Skipping deleting pod's %s network %s", podObj.GetName(), networkName)
+		return nil
+	}
+
 	cniParams, err := c.getCNIParams(podObj, networkName, np)
 	if err != nil {
 		return err
@@ -236,10 +254,8 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 				glog.V(4).Infof("Failed to unmarshall pod's %s old networks annotation, ignore: %s", podName, err)
 				return
 			}
-			np := cniPodNetworkProperty{}
 			for _, n := range nets {
-				np.IfMAC = n.IfMAC
-				np.IsPrimary = n.IsPrimary
+				np := n.ToProperty()
 				err := c.delNetwork(newPod, n.NetworkName, np)
 				if err != nil {
 					glog.Errorf("Failed to delete network %s on pod %s", n.NetworkName, podName)
@@ -260,10 +276,8 @@ func (c *Controller) addNetworks(pod *apiv1.Pod, networkAnnotation string) {
 		return
 	}
 
-	np := cniPodNetworkProperty{}
 	for _, n := range nets {
-		np.IfMAC = n.IfMAC
-		np.IsPrimary = n.IsPrimary
+		np := n.ToProperty()
 		err := c.addNetwork(pod, n.NetworkName, np)
 		if err != nil {
 			glog.Errorf("Failed to add network %s on pod %s", n.NetworkName, podName)
