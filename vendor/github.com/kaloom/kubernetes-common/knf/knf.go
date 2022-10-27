@@ -46,4 +46,6 @@ type NetworkConf struct {
 	KNID               uint64   `json:"knid"`
 	ParticipatingNodes []net.IP `json:"participatingNodes"`
 	MTU                int      `json:"mtu"`
+	NAT                bool     `json:"nat"`
+	GWPort             string   `json:"gwPort"`
 }
