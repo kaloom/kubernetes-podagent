@@ -19,21 +19,14 @@ package controller
 import (
 	"container/list"
 	"fmt"
-	"github.com/golang/glog"
 	"sync"
-)
 
-type OpType int
-
-const (
-	Add OpType = iota
-	Delete
+	"github.com/golang/glog"
 )
 
 // Event struct
 type Event struct {
-	opType OpType
-	data   interface{}
+	data interface{}
 }
 
 // EventQueue is a FIFO type queue
@@ -65,14 +58,8 @@ func (eq *EventQueue) Enqueue(event *Event) {
 
 	key := event.getKey()
 	glog.V(5).Infof("Enqueuing using key:%s", key)
-	if e, ok := eq.m[key]; ok {
-		ev := e.Value.(Event)
-		if ev.opType != event.opType {
-			glog.Infof("Cancelling events from queue - events cancels each others:", ev)
-			eq.q.Remove(e)
-			delete(eq.m, key)
-			return
-		}
+	if _, ok := eq.m[key]; ok {
+		return
 	}
 
 	e := eq.q.PushBack(*event)

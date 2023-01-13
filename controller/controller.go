@@ -57,10 +57,11 @@ func (ct ContainerType) String() string {
 
 // Controller the controller object
 type Controller struct {
-	kubeClient *kubernetes.Clientset
-	runtime    Runtime
-	cniPlugin  *cni.NetworkPlugin
-	eventQueue *EventQueue
+	kubeClient  *kubernetes.Clientset
+	runtime     Runtime
+	cniPlugin   *cni.NetworkPlugin
+	eventQueue  *EventQueue
+	configStore *ConfigStore
 }
 
 // Run starts a Pod resource controller
@@ -110,10 +111,11 @@ func NewController(kubeClient *kubernetes.Clientset, endpoint, cniBinPath, cniCo
 		return nil, err
 	}
 	c := &Controller{
-		kubeClient: kubeClient,
-		runtime:    runTime,
-		cniPlugin:  cniPlugin,
-		eventQueue: newQueue(),
+		kubeClient:  kubeClient,
+		runtime:     runTime,
+		cniPlugin:   cniPlugin,
+		eventQueue:  newQueue(),
+		configStore: newConfigStore(),
 	}
 	return c, nil
 }

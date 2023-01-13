@@ -50,6 +50,12 @@ type Parameters struct {
 	IfMAC       string
 }
 
+// AttachmentTuple the attachment tuple for the cni-plugin
+type AttachmentTuple struct {
+	PodName     string
+	NetworkName string
+}
+
 // NetworkPlugin object to export
 type NetworkPlugin struct {
 	sync.RWMutex
