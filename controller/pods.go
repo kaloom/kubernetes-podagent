@@ -64,42 +64,100 @@ const (
 // Process will take a element from the FIFO queue and attempt to process it (either add or remove network)
 func (c *Controller) Process(e *Event) {
 	var err error
-	switch e.opType {
-	case Add:
-		for i := 0; i < maxRetries; i++ {
-			err = c.cniPlugin.AddNetwork(e.data.(*cni.Parameters))
-			if err == nil {
-				if i > 0 {
-					glog.Infof("Succeeded adding network %+v after %d attempt", e.data, i)
-				} else {
-					glog.V(5).Infof("Succeeded adding network %+v on first attempt", e.data)
-				}
-				return
-			}
-			glog.Warningf("Failed adding network %+v... retrying %d/%d. err:%v", e.data, i+1, maxRetries, err)
-			time.Sleep(retryDelay)
-		}
-		glog.Errorf("Failed adding network %+v after %d attempt. err:%v", e.data, maxRetries, err)
 
-	case Delete:
-		for i := 0; i < maxRetries; i++ {
-			err = c.cniPlugin.DeleteNetwork(e.data.(*cni.Parameters))
-			if err == nil {
-				if i > 0 {
-					glog.Infof("Succeeded deleting network %+v after %d attempt", e.data, i)
-				} else {
-					glog.V(5).Infof("Succeeded deleting network %+v on first attempt", e.data)
-				}
-				return
-			}
-			glog.Warningf("Failed deleting network %+v... retrying %d/%d. err:%v", e.data, i+1, maxRetries, err)
-			time.Sleep(retryDelay)
-		}
-		glog.Errorf("Failed deleting network %+v after %d attempt. err:%v", e.data, maxRetries, err)
-
-	default:
-		glog.Errorf("processing invalid operation type value in event %+v", e)
+	attachmentTuple := e.data.(*cni.AttachmentTuple)
+	key := c.configStore.getConfigRecordKey(attachmentTuple.PodName, attachmentTuple.NetworkName)
+	cfgRecord, err := c.configStore.getConfigRecord(key)
+	if err != nil {
+		glog.V(3).Infof("network config record not found, ignoring event %+v ", e.data)
+		return
 	}
+
+	switch cfgRecord.Expected.Optype {
+	case Add:
+		if cfgRecord.Running.State == Nil {
+			err = c.applyAddNetwork(key, cfgRecord, e)
+			if err != nil {
+				c.eventQueue.Enqueue(&Event{data: e.data})
+			}
+			return
+		}
+		if cfgRecord.Running.State == Dirty ||
+			!c.configStore.isConfigSame(cfgRecord.Expected, cfgRecord.Running) {
+			err = c.applyDeleteNetwork(key, cfgRecord, e)
+			if err != nil {
+				c.eventQueue.Enqueue(&Event{data: e.data})
+				return
+			}
+			err = c.applyAddNetwork(key, cfgRecord, e)
+			if err != nil {
+				c.eventQueue.Enqueue(&Event{data: e.data})
+			}
+			return
+		}
+		glog.V(3).Infof("ignoring adding network as the same network is already running %+v", e.data)
+	case Delete:
+		if cfgRecord.Running.State == Nil {
+			glog.V(3).Infof("ignoring deleting network as it's not added %+v", e.data)
+			return
+		}
+		err = c.applyDeleteNetwork(key, cfgRecord, e)
+		if err != nil {
+			c.eventQueue.Enqueue(&Event{data: e.data})
+		}
+	default:
+		glog.Errorf("processing invalid expected state in config record %+v in event %+v", cfgRecord, e)
+	}
+}
+
+func (c *Controller) applyDeleteNetwork(key string, cfgRecord ConfigRecord, e *Event) error {
+	cfgRecord.Running.State = Dirty
+	err := c.configStore.saveRunningConfig(key, cfgRecord.Running)
+	if err != nil {
+		glog.Errorf("Failed saving running config err:%v", err)
+		return err
+	}
+
+	err = c.cniPlugin.DeleteNetwork(getRunningCNIParams(cfgRecord.Running.Data))
+	if err != nil {
+		glog.Errorf("Failed deleting network %+v err:%v", e.data, err)
+		return fmt.Errorf("Failed to delete network %+v err:%w", e.data, err)
+	}
+	err = c.configStore.saveRunningConfig(key, RunningConfig{State: Nil})
+	if err != nil {
+		glog.Errorf("Failed saving running config err:%v", err)
+		return err
+	}
+	glog.V(3).Infof("Succeeded deleting network %+v", e.data)
+	return nil
+}
+
+func (c *Controller) applyAddNetwork(key string, cfgRecord ConfigRecord, e *Event) error {
+	cfgRecord.Running.Data = cfgRecord.Expected.Data
+	cfgRecord.Running.State = Dirty
+	// Note: saveRunningConfig can fail if the pod is deleted in between,
+	// an error is returned to the caller, the caller(worker) requeue the event e again.
+	// worker while processing the event e in the next run removes the event permanently.
+	err := c.configStore.saveRunningConfig(key, cfgRecord.Running)
+	if err != nil {
+		glog.Errorf("Failed saving running config err:%v", err)
+		return err
+	}
+
+	err = c.cniPlugin.AddNetwork(getRunningCNIParams(cfgRecord.Running.Data))
+	if err != nil {
+		glog.Errorf("Failed adding network %+v err:%v", e.data, err)
+		return fmt.Errorf("Failed to add network %+v err:%w", e.data, err)
+	}
+
+	cfgRecord.Running.State = Active
+	c.configStore.saveRunningConfig(key, cfgRecord.Running)
+	if err != nil {
+		glog.Errorf("Failed saving running config err:%v", err)
+		return err
+	}
+	glog.V(3).Infof("Succeeded adding network %+v", e.data)
+	return nil
 }
 
 func getNetworkSet(networks string) (gset.GSet, error) {
@@ -123,6 +181,19 @@ func getNetworks(networks string) (cniPodNetworks, error) {
 	return nets, nil
 }
 
+func getRunningCNIParams(data interface{}) *cni.Parameters {
+	tdata := data.(map[string]interface{})
+	cniParams := &cni.Parameters{
+		Namespace:   tdata["Namespace"].(string),
+		PodName:     tdata["PodName"].(string),
+		SandboxID:   tdata["SandboxID"].(string),
+		NetnsPath:   tdata["NetnsPath"].(string),
+		NetworkName: tdata["NetworkName"].(string),
+		IfMAC:       tdata["IfMAC"].(string),
+	}
+	return cniParams
+}
+
 func getContainerID(pod *apiv1.Pod) string {
 	cidURI := pod.Status.ContainerStatuses[0].ContainerID
 	// format is docker://<cid>
@@ -131,6 +202,14 @@ func getContainerID(pod *apiv1.Pod) string {
 		return parts[1]
 	}
 	return cidURI
+}
+
+func (c *Controller) getCNIAttachmentTuple(podName, networkName string) *cni.AttachmentTuple {
+	cniAttachmentTuple := &cni.AttachmentTuple{
+		PodName:     podName,
+		NetworkName: networkName,
+	}
+	return cniAttachmentTuple
 }
 
 func (c *Controller) getCNIParams(podObj *apiv1.Pod, networkName string, np cniPodNetworkProperty) (*cni.Parameters, error) {
@@ -176,7 +255,13 @@ func (c *Controller) addNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 		return err
 	}
 
-	c.eventQueue.Enqueue(&Event{opType: Add, data: cniParams})
+	key := c.configStore.getConfigRecordKey(podObj.GetName(), networkName)
+	err = c.configStore.saveExpectedConfig(key, ExpectedConfig{Optype: Add, Data: cniParams})
+	if err != nil {
+		return err
+	}
+	c.eventQueue.Enqueue(&Event{data: c.getCNIAttachmentTuple(podObj.GetName(), networkName)})
+
 	return nil
 }
 
@@ -190,12 +275,12 @@ func (c *Controller) delNetwork(podObj *apiv1.Pod, networkName string, np cniPod
 		return nil
 	}
 
-	cniParams, err := c.getCNIParams(podObj, networkName, np)
+	key := c.configStore.getConfigRecordKey(podObj.GetName(), networkName)
+	err := c.configStore.saveExpectedConfig(key, ExpectedConfig{Optype: Delete})
 	if err != nil {
 		return err
 	}
-
-	c.eventQueue.Enqueue(&Event{opType: Delete, data: cniParams})
+	c.eventQueue.Enqueue(&Event{data: c.getCNIAttachmentTuple(podObj.GetName(), networkName)})
 	return nil
 }
 
@@ -267,6 +352,35 @@ func (c *Controller) podUpdated(oldObj, newObj interface{}) {
 	}
 }
 
+func (c *Controller) podDeleted(podObj interface{}) {
+	pod := podObj.(*apiv1.Pod)
+	podName := pod.ObjectMeta.Name
+	glog.V(5).Infof("Pod Deleted: %s", podName)
+	networks, ok := pod.Annotations["networks"]
+	if !ok {
+		glog.V(5).Infof("Pod %s does not contain any networks, skipping", podName)
+		return
+	}
+
+	c.delPendingNetworks(pod, networks)
+}
+
+func (c *Controller) delPendingNetworks(pod *apiv1.Pod, networkAnnotation string) {
+	podName := pod.ObjectMeta.Name
+	glog.V(5).Infof("Pod's %s with networks annotation '%s' got deleted", podName, networkAnnotation)
+	nets, err := getNetworks(networkAnnotation)
+	if err != nil {
+		glog.V(4).Infof("Failed to unmarshall pod's %s existing networks annotation, ignore: %s", podName, err)
+		return
+	}
+
+	for _, n := range nets {
+		key := c.configStore.getConfigRecordKey(podName, n.NetworkName)
+		c.configStore.delConfigRecord(key)
+		glog.V(5).Infof("Pod's %s pending network '%s' got deleted", podName, n.NetworkName)
+	}
+}
+
 func (c *Controller) addNetworks(pod *apiv1.Pod, networkAnnotation string) {
 	podName := pod.ObjectMeta.Name
 	glog.V(5).Infof("Pod's %s networks annotation '%s' got added", podName, networkAnnotation)
@@ -328,8 +442,9 @@ func (c *Controller) watchPods(ctx context.Context, nodeName string) (cache.Cont
 		// old == new so nothing happens
 		0,
 		cache.ResourceEventHandlerFuncs{
-			AddFunc: c.podAdded,
+			AddFunc:    c.podAdded,
 			UpdateFunc: c.podUpdated,
+			DeleteFunc: c.podDeleted,
 		},
 	)
 
