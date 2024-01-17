@@ -24,7 +24,6 @@ import (
 	dockertypes "github.com/docker/docker/api/types"
 	"github.com/golang/glog"
 
-	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
 	"k8s.io/kubernetes/pkg/kubelet/util/cache"
 )
 

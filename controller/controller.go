@@ -24,12 +24,10 @@ import (
 
 	"github.com/kaloom/kubernetes-podagent/controller/cni"
 	ccri "github.com/kaloom/kubernetes-podagent/controller/crio-runtime"
-	dcri "github.com/kaloom/kubernetes-podagent/controller/docker-runtime"
 
 	"github.com/golang/glog"
 
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
 )
 
 // ContainerType defines the type if continer used to support the pods
@@ -88,7 +86,6 @@ func (c *Controller) Run(ctx context.Context, nodeName string) error {
 // NewController instantiate a docker controller object
 func NewController(kubeClient *kubernetes.Clientset, endpoint, cniBinPath, cniConfPath, cniVendor string, containerType ContainerType) (*Controller, error) {
 	runtimeRequestTimeout := 2 * time.Minute
-	imagePullProgressDeadline := time.Minute
 
 	var runTime Runtime
 	var err error
@@ -97,10 +94,7 @@ func NewController(kubeClient *kubernetes.Clientset, endpoint, cniBinPath, cniCo
 		runTime, err = ccri.NewCrioRuntime(endpoint, runtimeRequestTimeout)
 
 	default:
-		dockerClient := libdocker.ConnectToDockerOrDie(endpoint,
-			runtimeRequestTimeout,
-			imagePullProgressDeadline)
-		runTime, err = dcri.NewDockerRuntime(dockerClient)
+		glog.Error("docker runtime has been disabled, please use crio")
 	}
 	if err != nil {
 		return nil, err

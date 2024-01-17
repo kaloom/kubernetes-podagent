@@ -27,7 +27,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 )
 
