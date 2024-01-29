@@ -2,8 +2,6 @@ module github.com/kaloom/kubernetes-podagent
 
 go 1.21
 
-toolchain go1.21.6
-
 require (
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/containernetworking/cni v0.8.1

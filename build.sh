@@ -39,4 +39,4 @@ export GOBIN=${PWD}/bin
 export GOPATH=${PWD}/${GOGRADLE_PROJECT_PATH}
 
 echo "Building $exec_name"
-go install -ldflags "${LDFLAGS}" "$@" ${repo_path}/${exec_name}
+go install -ldflags "${LDFLAGS}" -mod=readonly "$@" ${repo_path}/${exec_name}

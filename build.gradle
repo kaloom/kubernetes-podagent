@@ -20,15 +20,7 @@ plugins {
 
 dependencies {
   golang {
-    build name:'github.com/kaloom/kubernetes-common', commit: 'LATEST_COMMIT'
-
-    build name:'k8s.io/client-go', commit:'271cb504b63ed762a3aea146bd842015da5a79c4'
-    build name:'k8s.io/apimachinery', commit:'e9a29eff7d472df0f7da9ead5ab59b74e74a07ec'
-    build name:'k8s.io/api', commit:'409c3b2393cd3359f275bd8b883b4d9c5aec41f6'
-    build name:'k8s.io/apiserver', commit:'d299c880c4e33854f8c45bdd7ab599fb54cbe575'
-    build name:'k8s.io/kubernetes', commit:'d515f0e3d2a2b3afc53fc839d6df6f34ed76c3bf'
-    build name:'k8s.io/utils', commit:'1dbc8f1cec395db25b912b93257c400765c08146'
-    build name:'k8s.io/apiextensions-apiserver', commit:'83f1a7e2b8384c17fb102b6616e08825ad12992d'
+    build name:'github.com/google/go-cmp/cmp', commit:'LATEST_COMMIT'
   }
 }
 
@@ -45,7 +37,7 @@ def buildDate = new Date().format("yyyy-MM-dd_HH:mm:ss.sss_Z", TimeZone.getTimeZ
 def ldflags = "-ldflags \"-X main.branch=${gitBranch} -X main.commit=${gitCommit} -X main.date=${buildDate}\""
 
 build {
-  go "build ${ldflags} -o ${project.binDir}/${project.execName} ${project.packageRepo}/${project.execName}"
+  go "build ${ldflags} -mod=readonly -o ${project.binDir}/${project.execName} ${project.packageRepo}/${project.execName}"
 }
 
 clean {
